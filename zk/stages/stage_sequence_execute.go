@@ -535,7 +535,7 @@ BatchLoop:
 				var allConditionsOK bool
 				var newTransactions []types.Transaction
 				var newIds []common.Hash
-				newTransactions, newIds, allConditionsOK, err = getNextPoolTransactions(ctx, cfg, executionAt, batchState.forkId, batchState.yieldedTransactions)
+				newTransactions, newIds, allConditionsOK, err = getNextPoolTransactions(ctx, cfg, executionAt, blockNumber, batchState.forkId, batchState.yieldedTransactions)
 				if err != nil {
 					return err
 				}

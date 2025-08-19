@@ -381,6 +381,11 @@ func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, 
 		tracedSenders[common.BytesToAddress([]byte(sender))] = struct{}{}
 	}
 
+	hugeTxConfig := new(ethconfig.HugeTxConfig)
+	*hugeTxConfig = ethCfg.DeprecatedTxPool.HugeTxConfig
+	hugeTxConfigPtr := atomic.Pointer[ethconfig.HugeTxConfig]{}
+	hugeTxConfigPtr.Store(hugeTxConfig)
+
 	tp := &TxPool{
 		lock:                    &sync.RWMutex{},
 		byHash:                  map[string]*metaTx{},
@@ -420,6 +425,9 @@ func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, 
 			// For OkPay
 			OkPaySenderAccountsList:    ethCfg.DeprecatedTxPool.OkPaySenderAccountsList,
 			OkPayBlockPriorityTxsLimit: ethCfg.DeprecatedTxPool.OkPayBlockPriorityTxsLimit,
+
+			// For X Layer, Huge Tx Config
+			HugeTxConfig: hugeTxConfigPtr,
 		},
 		freeGasAddrs: map[string]bool{},
 	}
@@ -720,15 +728,15 @@ func (p *TxPool) ResetYieldedStatus() {
 	}
 }
 
-func (p *TxPool) YieldBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
+func (p *TxPool) YieldBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
 	// For X Layer
-	return p.bestForXLayer(n, txs, tx, onTopOf, availableGas, availableBlobGas, toSkip)
+	return p.bestForXLayer(n, txs, tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas, toSkip)
 }
 
-func (p *TxPool) PeekBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas, availableBlobGas uint64) (bool, error) {
+func (p *TxPool) PeekBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas uint64) (bool, error) {
 	set := mapset.NewThreadUnsafeSet[[32]byte]()
 	// For X Layer
-	onTime, _, err := p.bestForXLayer(n, txs, tx, onTopOf, availableGas, availableBlobGas, set)
+	onTime, _, err := p.bestForXLayer(n, txs, tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas, set)
 	return onTime, err
 }
 

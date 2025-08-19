@@ -206,7 +206,7 @@ func getNextTransactions(
 			remainingBlobGas = cfg.chainConfig.GetMaxBlobGasPerBlock() - *header.BlobGasUsed
 		}
 
-		if _, count, err = cfg.txPool2.YieldBest(amount, &txSlots, poolTx, executionAt, remainingGas, remainingBlobGas, alreadyYielded); err != nil {
+		if _, count, err = cfg.txPool2.YieldBest(amount, &txSlots, poolTx, executionAt, header.Number.Uint64(), remainingGas, remainingBlobGas, alreadyYielded); err != nil {
 			return err
 		}
 

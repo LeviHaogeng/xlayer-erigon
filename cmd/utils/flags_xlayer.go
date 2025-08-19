@@ -108,6 +108,21 @@ var (
 		Usage: "EnableTimsort enable timsort to instead of built-in sorting",
 		Value: false,
 	}
+	TxPoolHugeTxThresholdRatio = cli.Uint64Flag{
+		Name:  "txpool.huge-tx-threshold-ratio",
+		Usage: "Percentage threshold of block gas limit to identify huge transactions (0-100)",
+		Value: 100,
+	}
+	TxPoolHugeTxQuotaRatio = cli.Uint64Flag{
+		Name:  "txpool.huge-tx-quota-ratio",
+		Usage: "Maximum percentage of block gas limit that can be consumed by huge transactions (0-100)",
+		Value: 100,
+	}
+	TxPoolIgnoreHugeTxQuotaInterval = cli.Uint64Flag{
+		Name:  "txpool.ignore-huge-tx-quota-interval",
+		Usage: "Block interval to ignore huge transaction quota restrictions. Set to 0 to disable huge tx quota entirely",
+		Value: 0,
+	}
 	// OkPay
 	OkPaySenderAccountsList = cli.StringFlag{
 		Name:  "okpay.sender-accounts-list",
@@ -581,6 +596,23 @@ func setTxPoolXLayer(ctx *cli.Context, cfg *ethconfig.DeprecatedTxPoolConfig) {
 	}
 	if ctx.IsSet(TxPoolEnableTimsort.Name) {
 		cfg.EnableTimsort = ctx.Bool(TxPoolEnableTimsort.Name)
+	}
+	if ctx.IsSet(TxPoolHugeTxThresholdRatio.Name) {
+		ratio := ctx.Uint64(TxPoolHugeTxThresholdRatio.Name)
+		if ratio > 100 {
+			panic(fmt.Sprintf("huge tx threshold ratio must be less than 100, but got %d", ratio))
+		}
+		cfg.HugeTxConfig.HugeTxThresholdRatio = ratio
+	}
+	if ctx.IsSet(TxPoolHugeTxQuotaRatio.Name) {
+		ratio := ctx.Uint64(TxPoolHugeTxQuotaRatio.Name)
+		if ratio > 100 {
+			panic(fmt.Sprintf("huge tx quota ratio must be less than 100, but got %d", ratio))
+		}
+		cfg.HugeTxConfig.HugeTxQuotaRatio = ratio
+	}
+	if ctx.IsSet(TxPoolIgnoreHugeTxQuotaInterval.Name) {
+		cfg.HugeTxConfig.IgnoreHugeTxQuotaInterval = ctx.Uint64(TxPoolIgnoreHugeTxQuotaInterval.Name)
 	}
 
 	// For OkPay

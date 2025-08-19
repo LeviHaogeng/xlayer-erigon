@@ -23,6 +23,12 @@ import (
 	"github.com/ledgerwatch/erigon-lib/txpool/txpoolcfg"
 )
 
+type HugeTxConfig struct {
+	HugeTxThresholdRatio      uint64
+	HugeTxQuotaRatio          uint64
+	IgnoreHugeTxQuotaInterval uint64
+}
+
 // DeprecatedTxPoolConfig are the configuration parameters of the transaction pool.
 type DeprecatedTxPoolConfig struct {
 	Disable  bool
@@ -69,6 +75,8 @@ type DeprecatedTxPoolConfig struct {
 	FreeGasList []FreeGasInfo
 	// EnableTimsort is the switch to use timsort on the best slice of txpool
 	EnableTimsort bool // For X Layer, optimize the txpool
+	// HugeTxConfig is the config for huge tx
+	HugeTxConfig HugeTxConfig
 
 	// For X Layer, OkPay config
 	// OkPaySenderAccountsList is the list of OkPay sender accounts

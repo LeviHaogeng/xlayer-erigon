@@ -3,6 +3,8 @@ package txpool
 import (
 	"container/heap"
 	"context"
+	"fmt"
+	"math"
 	"math/big"
 	"slices"
 	"strings"
@@ -71,6 +73,8 @@ type XLayerConfig struct {
 	OkPaySenderAccountsList common.OrderedList[common.Address]
 	// OkPayBlockPriorityTxsLimit is the max number of OkPay txs that we will prioritize per block
 	OkPayBlockPriorityTxsLimit uint64
+
+	HugeTxConfig atomic.Pointer[ethconfig.HugeTxConfig]
 }
 
 type GPCache interface {
@@ -81,7 +85,7 @@ type GPCache interface {
 	SetLatestRawGP(rgp *big.Int)
 }
 
-func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
+func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
 	removeWG.Wait()
 
 	if p.isDeniedYieldingTransactions() {
@@ -95,16 +99,27 @@ func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, a
 		return false, 0, nil
 	}
 
+	hugeTxConfig := p.xlayerCfg.HugeTxConfig.Load()
+	ignoreHugeTxQuota := nextBlockNumber%(hugeTxConfig.IgnoreHugeTxQuotaInterval+1) == 0
+
+	var hugeTxMinimalGas, hugeTxQuotaGas uint64
+	if ignoreHugeTxQuota {
+		hugeTxMinimalGas = math.MaxUint64
+		hugeTxQuotaGas = availableGas
+	} else {
+		hugeTxMinimalGas = hugeTxConfig.HugeTxThresholdRatio * availableGas / 100
+		hugeTxQuotaGas = hugeTxConfig.HugeTxQuotaRatio * availableGas / 100
+	}
+
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 
 	best := p.pending.best
 
-	// TODO
 	readContext := NewReadContext(
 		cmp.Min(int(n), len(best.ms)),
-		0, // TODO
-		0, // TODO
+		hugeTxMinimalGas,
+		hugeTxQuotaGas,
 		availableGas,
 		availableBlobGas,
 		toSkip,
@@ -125,7 +140,7 @@ func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, a
 	}
 
 	// Add all other txs
-	readContext.SetHugeTxQuota(0, 0) // TODO
+	readContext.SetHugeTxQuota(hugeTxMinimalGas, hugeTxQuotaGas)
 	ok, err = p.bestRead(n, tx, onTopOf, readContext, false)
 	if err != nil {
 		count := readContext.Finalize(txs)
@@ -401,6 +416,9 @@ func (p *TxPool) listenApollo(ctx context.Context) {
 				p.setFreeGasList(ethCfg.DeprecatedTxPool.FreeGasList)
 				p.lock.Unlock()
 			}
+			if isContainsHugeTxConfig(ethCfg.XLayer.ApolloChanged) {
+				p.setHugeTxConfig(ethCfg.DeprecatedTxPool.HugeTxConfig)
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -419,6 +437,19 @@ func (p *TxPool) getOkPayTxPriorityCount() uint64 {
 		return p.apolloCfg.GetOkPayBlockPriorityTxsLimit(p.xlayerCfg.OkPayBlockPriorityTxsLimit)
 	}
 	return p.xlayerCfg.OkPayBlockPriorityTxsLimit
+}
+
+func (p *TxPool) setHugeTxConfig(hugeTxConfig ethconfig.HugeTxConfig) {
+	if hugeTxConfig.HugeTxThresholdRatio > 100 {
+		panic(fmt.Sprintf("huge tx threshold ratio must be less than 100, but got %d", hugeTxConfig.HugeTxThresholdRatio))
+	}
+	if hugeTxConfig.HugeTxQuotaRatio > 100 {
+		panic(fmt.Sprintf("huge tx quota ratio must be less than 100, but got %d", hugeTxConfig.HugeTxQuotaRatio))
+	}
+
+	cfg := new(ethconfig.HugeTxConfig)
+	*cfg = hugeTxConfig
+	p.xlayerCfg.HugeTxConfig.Store(cfg)
 }
 
 var requireTxPoolLock atomic.Bool
@@ -442,4 +473,15 @@ func (p *PendingPool) RemoveNoLock(i *metaTx) {
 		p.sorted.Swap(false)
 	}
 	i.currentSubPool = 0
+}
+
+func isContainsHugeTxConfig(changed []string) bool {
+	for _, c := range changed {
+		if c == utils.TxPoolHugeTxThresholdRatio.Name ||
+			c == utils.TxPoolHugeTxQuotaRatio.Name ||
+			c == utils.TxPoolIgnoreHugeTxQuotaInterval.Name {
+			return true
+		}
+	}
+	return false
 }
