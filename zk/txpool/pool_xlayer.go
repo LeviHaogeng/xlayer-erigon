@@ -13,7 +13,6 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/cmp"
-	"github.com/ledgerwatch/erigon-lib/common/fixedgas"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/types"
 	"github.com/ledgerwatch/erigon/cmd/utils"
@@ -82,15 +81,6 @@ type GPCache interface {
 	SetLatestRawGP(rgp *big.Int)
 }
 
-type ReadContext struct {
-	txs              *types.TxsRlp
-	availableGas     uint64
-	availableBlobGas uint64
-	toSkip           mapset.Set[[32]byte]
-	toRemove         []*metaTx
-	count            int
-}
-
 func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
 	removeWG.Wait()
 
@@ -109,36 +99,45 @@ func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, a
 	defer p.lock.RUnlock()
 
 	best := p.pending.best
-	readContext := ReadContext{
-		txs:              txs,
-		availableGas:     availableGas,
-		availableBlobGas: availableBlobGas,
-		toSkip:           toSkip,
-		count:            0,
-	}
-	readContext.txs.Resize(uint(cmp.Min(int(n), len(best.ms))))
+
+	// TODO
+	readContext := NewReadContext(
+		cmp.Min(int(n), len(best.ms)),
+		0, // TODO
+		0, // TODO
+		availableGas,
+		availableBlobGas,
+		toSkip,
+	)
 
 	p.pending.EnforceBestInvariants()
 
 	// Prioritize OkPay txs first
-	ok, err := p.bestRead(n, tx, onTopOf, &readContext, true)
+	readContext.SetIncludeAllTxs() // for okpay txs, we don't distinguish huge txs and normal txs
+	ok, err := p.bestRead(n, tx, onTopOf, readContext, true)
 	if err != nil {
-		return ok, readContext.count, err
+		count := readContext.Finalize(txs)
+		return ok, count, err
 	}
 	if !ok {
-		return false, readContext.count, nil
+		count := readContext.Finalize(txs)
+		return false, count, nil
 	}
 
 	// Add all other txs
-	ok, err = p.bestRead(n, tx, onTopOf, &readContext, false)
+	readContext.SetHugeTxQuota(0, 0) // TODO
+	ok, err = p.bestRead(n, tx, onTopOf, readContext, false)
 	if err != nil {
-		return ok, readContext.count, err
+		count := readContext.Finalize(txs)
+		return ok, count, err
 	}
 	if !ok {
-		return false, readContext.count, nil
+		count := readContext.Finalize(txs)
+		return false, count, nil
 	}
 
-	readContext.txs.Resize(uint(readContext.count))
+	count := readContext.Finalize(txs)
+	txs.Resize(uint(count))
 	if len(readContext.toRemove) > 0 {
 		removeWG.Add(1)
 		go func() {
@@ -154,10 +153,10 @@ func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, a
 		time.Sleep(1 * time.Nanosecond)
 	}
 
-	return true, readContext.count, nil
+	return true, count, nil
 }
 
-func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *ReadContext, isOkPayPriority bool) (bool, error) {
+func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *readContext, isOkPayPriority bool) (bool, error) {
 	isShanghai := p.isShanghai()
 	isLondon := p.isLondon()
 	best := p.pending.best
@@ -165,24 +164,22 @@ func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *ReadC
 	okPayTxPriorityCount := uint64(0)
 	maxOkPayTxPriorityCount := p.getOkPayTxPriorityCount()
 
-	for i := 0; readContext.count < int(n) && i < len(best.ms); i++ {
-		// if we wouldn't have enough gas for a standard transaction then quit out early
-		if readContext.availableGas < fixedgas.TxGas {
+	for i := 0; i < len(best.ms); i++ {
+		if readContext.IsFullfilled() {
 			break
 		}
 
 		mt := best.ms[i]
 		//log.Trace("Processing transaction", "txID", mt.Tx.IDHash)
 
-		if readContext.toSkip.Contains(mt.Tx.IDHash) {
+		if readContext.IsSkip(mt.Tx.IDHash) {
 			//log.Trace("Skipping transaction, already in toSkip", "txID", mt.Tx.IDHash)
 			continue
 		}
 
 		if !isLondon && mt.Tx.Type == 0x2 {
 			// remove ldn txs when not in london
-			readContext.toRemove = append(readContext.toRemove, mt)
-			readContext.toSkip.Add(mt.Tx.IDHash)
+			readContext.AddToSkipAndRemove(mt)
 			//log.Info("Removing London transaction in non-London environment", "txID", mt.Tx.IDHash)
 			continue
 		}
@@ -199,7 +196,7 @@ func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *ReadC
 			return false, err
 		}
 		if len(rlpTx) == 0 {
-			readContext.toRemove = append(readContext.toRemove, mt)
+			readContext.AddToSkipAndRemove(mt)
 			//log.Info("Removing transaction with empty RLP", "txID", common.BytesToHash(mt.Tx.IDHash[:]))
 			continue
 		}
@@ -217,34 +214,18 @@ func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *ReadC
 		}
 
 		// Skip transactions that require more blob gas than is available
-		blobCount := uint64(len(mt.Tx.BlobHashes))
-		if blobCount*fixedgas.BlobGasPerBlob > readContext.availableBlobGas {
+		if !readContext.ConsumeBlobGas(uint64(len(mt.Tx.BlobHashes))) {
 			//log.Trace("Skipping transaction due to insufficient blob gas", "txID", mt.Tx.IDHash, "requiredBlobGas", blobCount*fixedgas.BlobGasPerBlob, "availableBlobGas", availableBlobGas)
 			continue
 		}
-		readContext.availableBlobGas -= blobCount * fixedgas.BlobGasPerBlob
 
 		// make sure we have enough gas in the caller to add this transaction.
 		// not an exact science using intrinsic gas but as close as we could hope for at
 		// this stage
 		intrinsicGas, _ := CalcIntrinsicGas(uint64(mt.Tx.DataLen), uint64(mt.Tx.DataNonZeroLen), nil, mt.Tx.Creation, true, true, isShanghai)
-		if intrinsicGas > readContext.availableGas {
-			// we might find another TX with a low enough intrinsic gas to include so carry on
-			//log.Trace("Skipping transaction due to insufficient gas", "txID", mt.Tx.IDHash, "intrinsicGas", intrinsicGas, "availableGas", availableGas)
+		if !readContext.AddTx(rlpTx, mt.Tx.IDHash, sender, isLocal, mt.Tx.Gas, intrinsicGas) {
 			continue
 		}
-
-		if intrinsicGas <= readContext.availableGas { // check for potential underflow
-			readContext.availableGas -= intrinsicGas
-		}
-
-		//log.Trace("Including transaction", "txID", mt.Tx.IDHash)
-		readContext.txs.Txs[readContext.count] = rlpTx
-		readContext.txs.TxIds[readContext.count] = mt.Tx.IDHash
-		copy(readContext.txs.Senders.At(readContext.count), sender.Bytes())
-		readContext.txs.IsLocal[readContext.count] = isLocal
-		readContext.toSkip.Add(mt.Tx.IDHash)
-		readContext.count++
 
 		// For OkPay
 		if isOkPayPriority && isOkPayTx {
