@@ -70,6 +70,21 @@ type StateAccount struct {
 	Storage map[string]string `json:"storage"`
 }
 
+// CallTracerResult represents the result from callTracer
+type CallTracerResult struct {
+	Calls        []CallTracerResult `json:"calls"`
+	From         string             `json:"from"`
+	Gas          string             `json:"gas"`
+	GasUsed      string             `json:"gasUsed"`
+	Input        string             `json:"input"`
+	Output       string             `json:"output,omitempty"`
+	To           string             `json:"to"`
+	Type         string             `json:"type"`
+	Value        string             `json:"value"`
+	Error        string             `json:"error,omitempty"`
+	RevertReason string             `json:"revertReason,omitempty"`
+}
+
 func toPreError(err error, result *core.ExecutionResult) PreError {
 	preErr := PreError{
 		Code: UnKnownErrCode,
@@ -291,7 +306,7 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, s
 			"prestateTracer": {
 				"diffMode": true
 			},
-			"callTracer": null
+			"callTracer": {}
 		}`)
 
 		tracer, err := tracers.New("muxTracer", &tracers.Context{
@@ -340,41 +355,7 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, s
 		gp := new(core.GasPool).AddGas(MaxGasLimit)
 		ibs.SetTxContext(txHash, header.Hash(), i)
 
-		// Create a dummy transaction for ApplyMessageWithTxContext
-		var dummyTx types.Transaction
-		if msg.To() != nil {
-			dummyTx = types.NewTransaction(
-				msg.Nonce(),
-				*msg.To(),
-				msg.Value(),
-				msg.Gas(),
-				msg.GasPrice(),
-				msg.Data(),
-			)
-		} else {
-			// Contract creation transaction
-			dummyTx = types.NewContractCreation(
-				msg.Nonce(),
-				msg.Value(),
-				msg.Gas(),
-				msg.GasPrice(),
-				msg.Data(),
-			)
-		}
-
-		var usedGasVar uint64
-		_, result, innerTxs, err := core.ApplyMessageWithTxContext(
-			msg,
-			txCtx,
-			gp,
-			ibs,
-			state.NewNoopWriter(), // state writer
-			header.Number,         // block number
-			dummyTx,               // transaction
-			&usedGasVar,           // used gas
-			evm,
-			true, // shouldFinalizeIbs
-		)
+		result, err := core.ApplyMessage(evm, core.Message(msg), gp, true, false)
 		if result != nil {
 			gasUsed = result.UsedGas
 		}
@@ -389,6 +370,7 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, s
 		}
 
 		var stateDiff map[string]interface{}
+		var innerTxs []*zktypes.InnerTx
 
 		// Get trace results from tracer if available
 		if tracer != nil {
@@ -403,6 +385,20 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, s
 							stateDiff = convertPrestateToStateDiff(prestateResult)
 						} else {
 							log.Warn("TransactionPreExec: failed to unmarshal prestateTracer result", "requestID", requestID, "error", err)
+						}
+					}
+
+					// Extract callTracer result and convert to innerTxs
+					if callTracerRaw, exists := muxResult["callTracer"]; exists {
+						var callTracerResult interface{}
+						if err := json.Unmarshal(callTracerRaw, &callTracerResult); err == nil {
+							if convertedInnerTxs, err := convertCallTracerResultToInnerTxs(callTracerResult); err == nil {
+								innerTxs = convertedInnerTxs
+							} else {
+								log.Warn("TransactionPreExec: failed to convert callTracer result to innerTxs", "requestID", requestID, "error", err)
+							}
+						} else {
+							log.Warn("TransactionPreExec: failed to unmarshal callTracer result", "requestID", requestID, "error", err)
 						}
 					}
 				} else {
@@ -557,5 +553,152 @@ func convertPrestateToStateDiff(traceResult interface{}) map[string]interface{} 
 		}
 	}
 
+	return result
+}
+
+// convertCallTracerResultToInnerTxs converts callTracer result to InnerTx array
+func convertCallTracerResultToInnerTxs(traceResult interface{}) (result []*zktypes.InnerTx, err error) {
+	if traceResult == nil {
+		return nil, fmt.Errorf("call tracer result is nil")
+	}
+	traceResultStr, err := json.Marshal(traceResult)
+	if err != nil {
+		return nil, err
+	}
+	callTx := CallTracerResult{}
+	if err := json.Unmarshal(traceResultStr, &callTx); err != nil {
+		return nil, err
+	}
+
+	result = make([]*zktypes.InnerTx, 0)
+	isError := false
+	var errorMsg string
+	if callTx.Error != "" {
+		isError = true
+		errorMsg = callTx.Error
+	}
+	if callTx.Error != "" && callTx.RevertReason != "" {
+		isError = true
+		errorMsg = fmt.Sprintf("%s,%s", callTx.Error, callTx.RevertReason)
+	}
+	gasUsed := new(big.Int)
+	if len(callTx.GasUsed) > 2 && strings.HasPrefix(callTx.GasUsed, "0x") {
+		gasUsed, _ = gasUsed.SetString(callTx.GasUsed[2:], 16)
+	}
+
+	valueWei := ""
+	if len(callTx.Value) > 2 && strings.HasPrefix(callTx.Value, "0x") {
+		valueWeiInt := new(big.Int)
+		valueWeiInt, _ = valueWeiInt.SetString(callTx.Value[2:], 16)
+		valueWei = valueWeiInt.String()
+	}
+
+	gas := new(big.Int)
+	if len(callTx.Gas) > 2 && strings.HasPrefix(callTx.Gas, "0x") {
+		gas, _ = gas.SetString(callTx.Gas[2:], 16)
+	}
+
+	innerTx := &zktypes.InnerTx{
+		Dept:          *big.NewInt(0),
+		InternalIndex: *big.NewInt(int64(0)),
+		CallType:      strings.ToLower(callTx.Type),
+		Name:          strings.ToLower(callTx.Type),
+		TraceAddress:  "0",
+		CodeAddress:   "",
+		From:          callTx.From,
+		To:            callTx.To,
+		Input:         callTx.Input,
+		Output:        callTx.Output,
+		IsError:       isError,
+		Gas:           gas.Uint64(),
+		GasUsed:       gasUsed.Uint64(),
+		Value:         valueWei,
+		ValueWei:      valueWei,
+		CallValueWei:  callTx.Value,
+		Error:         errorMsg,
+	}
+	result = append(result, innerTx)
+	if len(callTx.Calls) > 0 {
+		// convert calls to innerTxs
+		callInnerTxs := convertCallsToInnerTxs(callTx.Calls, 0, "", isError)
+		result = append(result, callInnerTxs...)
+	}
+
+	return
+}
+
+// convertCallsToInnerTxs converts nested calls to InnerTx array
+func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepthIndexRoot string, isError bool) (result []*zktypes.InnerTx) {
+	result = make([]*zktypes.InnerTx, 0)
+	depth := lastDepth + 1
+	for index, callTx := range calls {
+		var errorMsg string
+		if callTx.Error != "" {
+			isError = true
+			errorMsg = callTx.Error
+		}
+		if callTx.Error != "" && callTx.RevertReason != "" {
+			isError = true
+			errorMsg = fmt.Sprintf("%s,%s", callTx.Error, callTx.RevertReason)
+		}
+		gasUsed := new(big.Int)
+		if len(callTx.GasUsed) > 2 && strings.HasPrefix(callTx.GasUsed, "0x") {
+			gasUsed, _ = gasUsed.SetString(callTx.GasUsed[2:], 16)
+		}
+
+		gas := new(big.Int)
+		if len(callTx.Gas) > 2 && strings.HasPrefix(callTx.Gas, "0x") {
+			gas, _ = gas.SetString(callTx.Gas[2:], 16)
+		}
+
+		valueWei := ""
+		if len(callTx.Value) > 2 && strings.HasPrefix(callTx.Value, "0x") {
+			valueWeiInt := new(big.Int)
+			valueWeiInt, _ = valueWeiInt.SetString(callTx.Value[2:], 16)
+			valueWei = valueWeiInt.String()
+		}
+
+		innerTx := &zktypes.InnerTx{
+			Dept:          *big.NewInt(depth),
+			InternalIndex: *big.NewInt(int64(index)),
+			CallType:      strings.ToLower(callTx.Type),
+			Name:          "",
+			TraceAddress:  "",
+			CodeAddress:   "",
+			From:          callTx.From,
+			To:            callTx.To,
+			Input:         callTx.Input,
+			Output:        callTx.Output,
+			IsError:       isError,
+			Gas:           gas.Uint64(),
+			GasUsed:       gasUsed.Uint64(),
+			Value:         valueWei,
+			ValueWei:      valueWei,
+			CallValueWei:  callTx.Value,
+			Error:         errorMsg,
+		}
+
+		// if CallType == "callcode", CodeAddress = callTx.To
+		if strings.ToLower(callTx.Type) == "callcode" {
+			innerTx.CodeAddress = callTx.To
+		}
+
+		// 记录深度
+		depthIndexRoot := fmt.Sprintf("%s_%d", lastDepthIndexRoot, index)
+		// set name
+		innerTx.Name = fmt.Sprintf("%s%s", innerTx.CallType, depthIndexRoot)
+		// set trace address
+		if lastDepthIndexRoot == "" {
+			innerTx.TraceAddress = fmt.Sprintf("%d", index)
+		} else {
+			innerTx.TraceAddress = fmt.Sprintf("%s,%d", strings.ReplaceAll(lastDepthIndexRoot, "_", ","), index)
+		}
+
+		result = append(result, innerTx)
+		if len(callTx.Calls) > 0 {
+			innerTxs := convertCallsToInnerTxs(callTx.Calls, depth, depthIndexRoot, isError)
+			result = append(result, innerTxs...)
+		}
+	}
 	return result
 }
