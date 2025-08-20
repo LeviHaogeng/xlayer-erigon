@@ -19,12 +19,12 @@ import (
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/state"
 	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/ledgerwatch/erigon/core/types/accounts"
 	"github.com/ledgerwatch/erigon/core/vm"
 	"github.com/ledgerwatch/erigon/eth/tracers"
 	"github.com/ledgerwatch/erigon/rpc"
 	"github.com/ledgerwatch/erigon/turbo/adapter/ethapi"
 	"github.com/ledgerwatch/erigon/turbo/rpchelper"
-	zktypes "github.com/ledgerwatch/erigon/zk/types"
 )
 
 const (
@@ -35,6 +35,27 @@ const (
 
 	MaxGasLimit = 30000000
 )
+
+// PreExecInnerTx defines the structure for inner transactions returned by TransactionPreExec RPC
+// This is specifically designed for the eth_transaction_preexec endpoint
+type PreExecInnerTx struct {
+	Dept          big.Int `json:"dept"`
+	InternalIndex big.Int `json:"internal_index"`
+	CallType      string  `json:"call_type"`
+	Name          string  `json:"name"`
+	TraceAddress  string  `json:"trace_address"`
+	CodeAddress   string  `json:"code_address"`
+	From          string  `json:"from"`
+	To            string  `json:"to"`
+	Input         string  `json:"input"`
+	Output        string  `json:"output"`
+	IsError       bool    `json:"is_error"`
+	GasUsed       uint64  `json:"gas_used"`
+	Value         string  `json:"value"`
+	ValueWei      string  `json:"value_wei"`
+	Error         string  `json:"error"`
+	ReturnGas     uint64  `json:"return_gas"`
+}
 
 // PreArgs represents the arguments for transaction pre-execution
 type PreArgs struct {
@@ -104,7 +125,13 @@ func toPreError(err error, result *core.ExecutionResult) PreError {
 	if strings.HasPrefix(preErr.Msg, "out of gas") {
 		preErr.Code = RevertedErrCode
 	}
-	if strings.HasPrefix(preErr.Msg, "insufficient funds") {
+	if strings.HasPrefix(preErr.Msg, "insufficient funds for transfer") {
+		preErr.Code = InsufficientBalanceErrCode
+	}
+	if strings.HasPrefix(preErr.Msg, "insufficient balance for transfer") {
+		preErr.Code = InsufficientBalanceErrCode
+	}
+	if strings.HasPrefix(preErr.Msg, "insufficient funds for gas * price") {
 		preErr.Code = InsufficientBalanceErrCode
 	}
 	return preErr
@@ -129,7 +156,7 @@ func (res PreResult) ToLogString() string {
 	return string(resBytes)
 }
 
-func toPreResult(innerTxs []*zktypes.InnerTx, logs []*types.Log, stateDiff map[string]interface{},
+func toPreResult(innerTxs []*PreExecInnerTx, logs []*types.Log, stateDiff map[string]interface{},
 	preError PreError, gasUsed uint64, number *big.Int) PreResult {
 	preResult := PreResult{
 		Error:       preError,
@@ -139,7 +166,7 @@ func toPreResult(innerTxs []*zktypes.InnerTx, logs []*types.Log, stateDiff map[s
 	if len(innerTxs) > 0 {
 		preResult.InnerTxs = innerTxs
 	} else {
-		preResult.InnerTxs = make([]*zktypes.InnerTx, 0)
+		preResult.InnerTxs = make([]*PreExecInnerTx, 0)
 	}
 	if len(logs) > 0 {
 		preResult.Logs = logs
@@ -227,11 +254,21 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, s
 		var gasUsed uint64
 		log.Info("TransactionPreExec", "requestID", requestID, "input index", i, "input args", origin.ToLogString())
 
-		// Basic parameter validation
-		if origin.From == nil {
+		if err := preArgsCheck(ibs, origin); err != nil {
 			preError := PreError{
 				Code: CheckPreArgsErrCode,
-				Msg:  "from address is required",
+				Msg:  err.Error(),
+			}
+			preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
+			preResList = append(preResList, preResult)
+			continue
+		}
+
+		// Check whether sender's nonce decreases in batch transactions
+		if i > 0 && *origin.From == *origins[i-1].From && origin.Nonce != nil && origins[i-1].Nonce != nil && uint64(*origin.Nonce) <= uint64(*origins[i-1].Nonce) {
+			preError := PreError{
+				Code: CheckPreArgsErrCode,
+				Msg:  fmt.Sprintf("%v nonce decreases, tx index %d has nonce %d, tx index %d has nonce %d", origin.From.Hex(), i-1, uint64(*origins[i-1].Nonce), i, uint64(*origin.Nonce)),
 			}
 			preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
 			preResList = append(preResList, preResult)
@@ -259,8 +296,14 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, s
 			continue
 		}
 
+		chainId := chainConfig.ChainID
+		if origin.ChainId != nil {
+			chainId = origin.ChainId
+		}
+
 		// Convert to transaction args
 		txArgs := ethapi.CallArgs{
+			ChainID:              (*hexutil.Big)(chainId),
 			From:                 origin.From,
 			To:                   origin.To,
 			Gas:                  origin.Gas,
@@ -360,56 +403,97 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, s
 			gasUsed = result.UsedGas
 		}
 
-		// Handle execution errors
-		var preError PreError
 		if err != nil {
-			log.Warn("TransactionPreExec: execution failed", "requestID", requestID, "index", i, "error", err.Error())
-			preError = toPreError(err, result)
-		} else if result != nil && result.Failed() {
-			preError = toPreError(result.Err, result)
+			log.Error("TransactionPreExec: core apply message failed", "requestID", requestID, "input args", origin.ToLogString(), "error", err.Error())
+			preError := toPreError(err, result)
+			preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
+			preResList = append(preResList, preResult)
+			continue
+		}
+
+		// Check if EVM was cancelled due to timeout
+		if evm.Cancelled() {
+			log.Error("TransactionPreExec: evm execution aborted timeout", "requestID", requestID, "input args", origin.ToLogString())
+			preError := PreError{
+				Code: UnKnownErrCode,
+				Msg:  fmt.Sprintf("execution aborted (timeout = %v)", timeout),
+			}
+			preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
+			preResList = append(preResList, preResult)
+			continue
 		}
 
 		var stateDiff map[string]interface{}
-		var innerTxs []*zktypes.InnerTx
+		var innerTxs []*PreExecInnerTx
 
 		// Get trace results from tracer if available
 		if tracer != nil {
-			if rawRes, err := tracer.GetResult(); err == nil {
-				// muxTracer returns format: {"prestateTracer": {...}, "callTracer": ...}
-				var muxResult map[string]json.RawMessage
-				if err := json.Unmarshal(rawRes, &muxResult); err == nil {
-					// Extract prestateTracer result
-					if prestateRaw, exists := muxResult["prestateTracer"]; exists {
-						var prestateResult interface{}
-						if err := json.Unmarshal(prestateRaw, &prestateResult); err == nil {
-							stateDiff = convertPrestateToStateDiff(prestateResult)
-						} else {
-							log.Warn("TransactionPreExec: failed to unmarshal prestateTracer result", "requestID", requestID, "error", err)
-						}
-					}
+			rawRes, err := tracer.GetResult()
+			if err != nil {
+				log.Error("TransactionPreExec: tracer get result failed", "requestID", requestID, "input args", origin.ToLogString(), "error", err.Error())
+				preError := toPreError(err, result)
+				preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
+				preResList = append(preResList, preResult)
+				continue
+			}
 
-					// Extract callTracer result and convert to innerTxs
-					if callTracerRaw, exists := muxResult["callTracer"]; exists {
-						var callTracerResult interface{}
-						if err := json.Unmarshal(callTracerRaw, &callTracerResult); err == nil {
-							if convertedInnerTxs, err := convertCallTracerResultToInnerTxs(callTracerResult); err == nil {
-								innerTxs = convertedInnerTxs
-							} else {
-								log.Warn("TransactionPreExec: failed to convert callTracer result to innerTxs", "requestID", requestID, "error", err)
-							}
-						} else {
-							log.Warn("TransactionPreExec: failed to unmarshal callTracer result", "requestID", requestID, "error", err)
-						}
-					}
-				} else {
-					log.Warn("TransactionPreExec: failed to unmarshal muxTracer result", "requestID", requestID, "error", err)
-				}
+			// muxTracer returns format: {"prestateTracer": {...}, "callTracer": ...}
+			var muxResult map[string]json.RawMessage
+			if err := json.Unmarshal(rawRes, &muxResult); err != nil {
+				log.Error("TransactionPreExec: failed to unmarshal muxTracer result", "requestID", requestID, "input args", origin.ToLogString(), "error", err.Error())
+				preError := toPreError(err, result)
+				preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
+				preResList = append(preResList, preResult)
+				continue
 			} else {
-				log.Warn("TransactionPreExec: failed to get tracer result", "requestID", requestID, "error", err)
+				// Extract prestateTracer result
+				if prestateRaw, exists := muxResult["prestateTracer"]; exists {
+					var prestateResult interface{}
+					if err := json.Unmarshal(prestateRaw, &prestateResult); err == nil {
+						stateDiff = convertPrestateToStateDiff(prestateResult)
+					} else {
+						log.Warn("TransactionPreExec: failed to unmarshal prestateTracer result", "requestID", requestID, "error", err)
+					}
+				}
+
+				// Extract callTracer result and convert to innerTxs
+				if callTracerRaw, exists := muxResult["callTracer"]; exists {
+					var callTracerResult interface{}
+					if err := json.Unmarshal(callTracerRaw, &callTracerResult); err == nil {
+						if convertedInnerTxs, err := convertCallTracerResultToInnerTxs(callTracerResult); err == nil {
+							innerTxs = convertedInnerTxs
+						} else {
+							log.Error("TransactionPreExec: failed to convert callTracer result to innerTxs", "requestID", requestID, "input args", origin.ToLogString(), "error", err.Error())
+							preError := toPreError(err, result)
+							preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
+							preResList = append(preResList, preResult)
+							continue
+						}
+					} else {
+						log.Error("TransactionPreExec: failed to unmarshal callTracer result", "requestID", requestID, "input args", origin.ToLogString(), "error", err.Error())
+						preError := toPreError(err, result)
+						preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
+						preResList = append(preResList, preResult)
+						continue
+					}
+				}
 			}
 		}
 
-		preRes := toPreResult(innerTxs, ibs.GetLogs(txHash), stateDiff, preError, gasUsed, blockBigNumber)
+		preRes := toPreResult(innerTxs, ibs.GetLogs(txHash), stateDiff, PreError{}, gasUsed, blockBigNumber)
+
+		// Handle execution result errors
+		if result != nil && result.Failed() {
+			preRes.Error = toPreError(result.Err, result)
+		}
+
+		if preRes.Error.Msg == "" && len(innerTxs) != 0 && innerTxs[0].Error != "" {
+			preRes.Error = PreError{
+				Code: RevertedErrCode,
+				Msg:  innerTxs[0].Error,
+			}
+		}
+
 		preResList = append(preResList, preRes)
 		log.Info("TransactionPreExec execute finished", "requestID", requestID, "index", i, "gasUsed", gasUsed)
 	}
@@ -557,7 +641,7 @@ func convertPrestateToStateDiff(traceResult interface{}) map[string]interface{} 
 }
 
 // convertCallTracerResultToInnerTxs converts callTracer result to InnerTx array
-func convertCallTracerResultToInnerTxs(traceResult interface{}) (result []*zktypes.InnerTx, err error) {
+func convertCallTracerResultToInnerTxs(traceResult interface{}) (result []*PreExecInnerTx, err error) {
 	if traceResult == nil {
 		return nil, fmt.Errorf("call tracer result is nil")
 	}
@@ -570,7 +654,7 @@ func convertCallTracerResultToInnerTxs(traceResult interface{}) (result []*zktyp
 		return nil, err
 	}
 
-	result = make([]*zktypes.InnerTx, 0)
+	result = make([]*PreExecInnerTx, 0)
 	isError := false
 	var errorMsg string
 	if callTx.Error != "" {
@@ -598,7 +682,15 @@ func convertCallTracerResultToInnerTxs(traceResult interface{}) (result []*zktyp
 		gas, _ = gas.SetString(callTx.Gas[2:], 16)
 	}
 
-	innerTx := &zktypes.InnerTx{
+	// Calculate ReturnGas = Gas - GasUsed
+	gasUint64 := gas.Uint64()
+	gasUsedUint64 := gasUsed.Uint64()
+	returnGas := uint64(0)
+	if gasUint64 > gasUsedUint64 {
+		returnGas = gasUint64 - gasUsedUint64
+	}
+
+	innerTx := &PreExecInnerTx{
 		Dept:          *big.NewInt(0),
 		InternalIndex: *big.NewInt(int64(0)),
 		CallType:      strings.ToLower(callTx.Type),
@@ -610,12 +702,11 @@ func convertCallTracerResultToInnerTxs(traceResult interface{}) (result []*zktyp
 		Input:         callTx.Input,
 		Output:        callTx.Output,
 		IsError:       isError,
-		Gas:           gas.Uint64(),
-		GasUsed:       gasUsed.Uint64(),
+		GasUsed:       gasUsedUint64,
 		Value:         valueWei,
 		ValueWei:      valueWei,
-		CallValueWei:  callTx.Value,
 		Error:         errorMsg,
+		ReturnGas:     returnGas,
 	}
 	result = append(result, innerTx)
 	if len(callTx.Calls) > 0 {
@@ -628,8 +719,8 @@ func convertCallTracerResultToInnerTxs(traceResult interface{}) (result []*zktyp
 }
 
 // convertCallsToInnerTxs converts nested calls to InnerTx array
-func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepthIndexRoot string, isError bool) (result []*zktypes.InnerTx) {
-	result = make([]*zktypes.InnerTx, 0)
+func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepthIndexRoot string, isError bool) (result []*PreExecInnerTx) {
+	result = make([]*PreExecInnerTx, 0)
 	depth := lastDepth + 1
 	for index, callTx := range calls {
 		var errorMsg string
@@ -658,7 +749,15 @@ func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepth
 			valueWei = valueWeiInt.String()
 		}
 
-		innerTx := &zktypes.InnerTx{
+		// Calculate ReturnGas = Gas - GasUsed
+		gasUint64 := gas.Uint64()
+		gasUsedUint64 := gasUsed.Uint64()
+		returnGas := uint64(0)
+		if gasUint64 > gasUsedUint64 {
+			returnGas = gasUint64 - gasUsedUint64
+		}
+
+		innerTx := &PreExecInnerTx{
 			Dept:          *big.NewInt(depth),
 			InternalIndex: *big.NewInt(int64(index)),
 			CallType:      strings.ToLower(callTx.Type),
@@ -670,12 +769,11 @@ func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepth
 			Input:         callTx.Input,
 			Output:        callTx.Output,
 			IsError:       isError,
-			Gas:           gas.Uint64(),
-			GasUsed:       gasUsed.Uint64(),
+			GasUsed:       gasUsedUint64,
 			Value:         valueWei,
 			ValueWei:      valueWei,
-			CallValueWei:  callTx.Value,
 			Error:         errorMsg,
+			ReturnGas:     returnGas,
 		}
 
 		// if CallType == "callcode", CodeAddress = callTx.To
@@ -701,4 +799,45 @@ func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepth
 		}
 	}
 	return result
+}
+
+// preArgsCheck validates transaction arguments
+func preArgsCheck(ibs *state.IntraBlockState, arg PreArgs) error {
+	if arg.From == nil {
+		return fmt.Errorf("from is nil")
+	}
+
+	if arg.To == nil {
+		return fmt.Errorf("to is nil")
+	}
+
+	if arg.Nonce == nil {
+		return fmt.Errorf("%s, nonce is nil", arg.From.Hex())
+	}
+
+	// Validate nonce against current state
+	msgFrom := *arg.From
+	msgNonce := uint64(*arg.Nonce)
+	stNonce := ibs.GetNonce(msgFrom)
+
+	// Check if nonce is too low
+	if stNonce > msgNonce {
+		return fmt.Errorf("nonce too low: address %v, tx: %d state: %d",
+			msgFrom.Hex(), msgNonce, stNonce)
+	}
+
+	// Check for nonce overflow
+	if stNonce+1 < stNonce {
+		return fmt.Errorf("nonce max exceeded: address %v, nonce: %d",
+			msgFrom.Hex(), stNonce)
+	}
+
+	// Make sure the sender is an EOA (not a contract)
+	codeHash := ibs.GetCodeHash(msgFrom)
+	if !accounts.IsEmptyCodeHash(codeHash) {
+		return fmt.Errorf("sender not EOA: address %v, codehash: %s",
+			msgFrom.Hex(), codeHash.Hex())
+	}
+
+	return nil
 }
