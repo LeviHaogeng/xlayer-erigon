@@ -823,9 +823,9 @@ func preArgsCheck(ibs *state.IntraBlockState, arg PreArgs) error {
 		return fmt.Errorf("from is nil")
 	}
 
-	// if arg.To == nil {
-	// 	return fmt.Errorf("to is nil")
-	// }
+	if arg.To == nil {
+		return fmt.Errorf("to is nil")
+	}
 
 	if arg.Nonce == nil {
 		return fmt.Errorf("%s, nonce is nil", arg.From.Hex())
