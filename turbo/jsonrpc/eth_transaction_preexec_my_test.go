@@ -28,6 +28,8 @@ import (
 	"github.com/ledgerwatch/erigon/rpc/rpccfg"
 	"github.com/ledgerwatch/erigon/turbo/adapter/ethapi"
 	"github.com/ledgerwatch/erigon/turbo/stages/mock"
+
+	_ "github.com/ledgerwatch/erigon/eth/tracers/native"
 )
 
 // Test helper functions
@@ -181,10 +183,12 @@ func TestTransactionPreExec_MultipleSimpleCalls(t *testing.T) {
 		// Gas should be standard transfer gas (21000)
 		assert.Equal(t, uint64(21000), result.GasUsed, "Transaction %d should use 21000 gas", i)
 
-		// Should have no inner transactions (simple transfers)
+		// Simple ETH transfers should NOT have inner transactions
 		innerTxs, ok := result.InnerTxs.([]*PreExecInnerTx)
 		if ok {
-			assert.Empty(t, innerTxs, "Transaction %d should have no inner transactions", i)
+			// Simple transfers should have empty inner transactions
+			assert.Empty(t, innerTxs, "Transaction %d (simple transfer) should have no inner transactions", i)
+			t.Logf("Transaction %d InnerTxs count: %d (expected: 0 for simple transfer)", i, len(innerTxs))
 		}
 
 		// Should have no logs (simple transfers)
@@ -404,10 +408,10 @@ func TestTransactionPreExec_MixedTransactions(t *testing.T) {
 		expectLogs  bool
 		expectError bool
 	}{
-		{"Simple Transfer", 0, false, false, false},
-		{"ERC20 Transfer", 1, false, false, false}, // May fail since contract doesn't exist
-		{"Complex Call", 2, false, false, false},   // May fail since contract doesn't exist
-		{"Simple Transfer", 3, false, false, false},
+		{"Simple Transfer", 0, false, false, false}, // Simple transfers should NOT have inner transactions
+		{"ERC20 Transfer", 1, true, false, false},   // Contract calls should have inner transactions
+		{"Complex Call", 2, true, false, false},     // Contract calls should have inner transactions
+		{"Simple Transfer", 3, false, false, false}, // Simple transfers should NOT have inner transactions
 	}
 
 	for _, scenario := range expectedScenarios {
@@ -420,12 +424,22 @@ func TestTransactionPreExec_MixedTransactions(t *testing.T) {
 			assert.Empty(t, result.Error.Msg, "%s should not have error", scenario.name)
 		}
 
-		// Check inner transactions (may be empty without tracer)
-		if scenario.expectInner {
-			innerTxs, ok := result.InnerTxs.([]*PreExecInnerTx)
-			if ok {
-				// In test environment without tracer, inner transactions may be empty
+		// Check inner transactions
+		innerTxs, ok := result.InnerTxs.([]*PreExecInnerTx)
+		if ok {
+			if scenario.expectInner {
+				// Contract calls should have inner transactions
+				assert.NotEmpty(t, innerTxs, "%s should have inner transactions", scenario.name)
 				t.Logf("%s has %d inner transactions", scenario.name, len(innerTxs))
+				if len(innerTxs) > 0 {
+					innerTx := innerTxs[0]
+					t.Logf("  First InnerTx: CallType=%s, From=%s, To=%s, GasUsed=%d",
+						innerTx.CallType, innerTx.From, innerTx.To, innerTx.GasUsed)
+				}
+			} else {
+				// Simple transfers should NOT have inner transactions
+				assert.Empty(t, innerTxs, "%s should NOT have inner transactions", scenario.name)
+				t.Logf("%s has %d inner transactions (expected: 0)", scenario.name, len(innerTxs))
 			}
 		}
 
