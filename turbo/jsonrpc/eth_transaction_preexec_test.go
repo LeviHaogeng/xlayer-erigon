@@ -177,7 +177,7 @@ func TestTransactionPreExec(t *testing.T) {
 	}
 
 	var result json.RawMessage
-	err = rpcClient.Call(&result, "eth_transactionPreExec", []interface{}{txRequest}, stateOverride)
+	err = rpcClient.Call(&result, "eth_transactionPreExec", []interface{}{txRequest}, "latest", stateOverride)
 	require.NoError(t, err)
 
 	// Parse the result
@@ -202,6 +202,11 @@ func TestTransactionPreExec(t *testing.T) {
 			}
 		}
 	}
+
+	require.NotNil(t, preExecResult["logs"], "Should have logs")
+	require.NotNil(t, preExecResult["stateDiff"], "Should have state difference")
+	require.NotNil(t, preExecResult["gasUsed"], "Should have gas used")
+	require.NotNil(t, preExecResult["blockNumber"], "Should have block number")
 
 	if innerTxs, exists := preExecResult["innerTxs"]; exists {
 		innerTxList, ok := innerTxs.([]interface{})
