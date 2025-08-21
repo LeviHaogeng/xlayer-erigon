@@ -469,14 +469,21 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, b
 				if callTracerRaw, exists := muxResult["callTracer"]; exists {
 					var callTracerResult interface{}
 					if err := json.Unmarshal(callTracerRaw, &callTracerResult); err == nil {
-						if convertedInnerTxs, err := convertCallTracerResultToInnerTxs(callTracerResult); err == nil {
-							innerTxs = convertedInnerTxs
-						} else {
-							log.Error("TransactionPreExec: failed to convert callTracer result to innerTxs", "requestID", requestID, "input args", origin.ToLogString(), "error", err.Error())
-							preError := toPreError(err, result)
-							preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
-							preResList = append(preResList, preResult)
-							continue
+						// Check if this is a simple native token transfer (no input data and recipient is not a contract)
+						isSimpleTransfer := (origin.Data == nil || len(*origin.Data) == 0) &&
+							(origin.Input == nil || len(*origin.Input) == 0) &&
+							(len(ibs.GetCode(*origin.To)) == 0)
+
+						if !isSimpleTransfer {
+							if convertedInnerTxs, err := convertCallTracerResultToInnerTxs(callTracerResult); err == nil {
+								innerTxs = convertedInnerTxs
+							} else {
+								log.Error("TransactionPreExec: failed to convert callTracer result to innerTxs", "requestID", requestID, "input args", origin.ToLogString(), "error", err.Error())
+								preError := toPreError(err, result)
+								preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
+								preResList = append(preResList, preResult)
+								continue
+							}
 						}
 					} else {
 						log.Error("TransactionPreExec: failed to unmarshal callTracer result", "requestID", requestID, "input args", origin.ToLogString(), "error", err.Error())
@@ -816,9 +823,9 @@ func preArgsCheck(ibs *state.IntraBlockState, arg PreArgs) error {
 		return fmt.Errorf("from is nil")
 	}
 
-	if arg.To == nil {
-		return fmt.Errorf("to is nil")
-	}
+	// if arg.To == nil {
+	// 	return fmt.Errorf("to is nil")
+	// }
 
 	if arg.Nonce == nil {
 		return fmt.Errorf("%s, nonce is nil", arg.From.Hex())
