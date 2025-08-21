@@ -824,6 +824,11 @@ func preArgsCheck(ibs *state.IntraBlockState, arg PreArgs) error {
 		return fmt.Errorf("%s, nonce is nil", arg.From.Hex())
 	}
 
+	// Check for EIP-1559 transaction fields - not supported
+	if arg.MaxFeePerGas != nil || arg.MaxPriorityFeePerGas != nil {
+		return fmt.Errorf("EIP-1559 transactions are not supported: maxFeePerGas and maxPriorityFeePerGas should not be set")
+	}
+
 	// Validate nonce against current state
 	msgFrom := *arg.From
 	msgNonce := uint64(*arg.Nonce)
