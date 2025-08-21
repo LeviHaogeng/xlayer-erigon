@@ -183,7 +183,7 @@ func toPreResult(innerTxs []*PreExecInnerTx, logs []*types.Log, stateDiff map[st
 }
 
 // TransactionPreExec executes multiple transactions in sequence and returns their execution results
-func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, stateOverrides *ethapi.StateOverrides) ([]PreResult, error) {
+func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, blockNrOrHash *rpc.BlockNumberOrHash, stateOverrides *ethapi.StateOverrides) ([]PreResult, error) {
 	start := time.Now()
 	requestID := uuid.NewString()
 	defer func(s time.Time, id string) {
@@ -199,26 +199,35 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, s
 	}
 	defer tx.Rollback()
 
-	// Get latest block state
-	blockNrOrHash := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
-	blockNumber, _, _, err := rpchelper.GetBlockNumber(blockNrOrHash, tx, api.filters)
+	// Use specified block or default to latest (consistent with other RPC methods)
+	bNrOrHash := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+	if blockNrOrHash != nil {
+		bNrOrHash = *blockNrOrHash
+	}
+
+	blockNumber, hash, _, err := rpchelper.GetCanonicalBlockNumber_zkevm(bNrOrHash, tx, api.filters)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create state reader
-	stateReader, err := rpchelper.CreateStateReader(ctx, tx, blockNrOrHash, 0, api.filters, api.stateCache, api.historyV3(tx), "")
+	// Create state reader for the specified block
+	stateReader, err := rpchelper.CreateStateReader(ctx, tx, bNrOrHash, 0, api.filters, api.stateCache, api.historyV3(tx), "")
 	if err != nil {
 		return nil, err
 	}
 
-	// Get header
-	header, err := api._blockReader.HeaderByNumber(ctx, tx, blockNumber)
+	// Get header - prefer by hash if available, otherwise by number
+	var header *types.Header
+	if hash != (common.Hash{}) {
+		header, err = api._blockReader.HeaderByHash(ctx, tx, hash)
+	} else {
+		header, err = api._blockReader.HeaderByNumber(ctx, tx, blockNumber)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if header == nil {
-		return nil, fmt.Errorf("block header not found: %d", blockNumber)
+		return nil, fmt.Errorf("block header not found for block %d (hash: %s)", blockNumber, hash.Hex())
 	}
 
 	// Create state
@@ -366,7 +375,7 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, s
 
 		// Create EVM
 		vmconfig := vm.Config{
-			Debug:      true, // CRITICAL: Enable debug mode for tracer to work
+			Debug:      tracer != nil, // Only enable debug mode when tracer is available
 			NoBaseFee:  true,
 			NoInnerTxs: false, // Enable inner transactions tracking
 		}
