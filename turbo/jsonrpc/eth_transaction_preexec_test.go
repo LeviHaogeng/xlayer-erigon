@@ -196,7 +196,7 @@ func TestTransactionPreExec(t *testing.T) {
 				if codeFloat, isFloat := code.(float64); isFloat {
 					errorCode := int(codeFloat)
 					if errorCode != 0 {
-						t.Logf("⚠️  PreExec returned error code %d: %v", errorCode, errorField)
+						t.Logf("PreExec returned error code %d: %v", errorCode, errorField)
 					}
 				}
 			}
@@ -245,8 +245,142 @@ func TestTransactionPreExec(t *testing.T) {
 	}
 
 	t.Logf("✅ eth_transactionPreExec successfully executed with inner transactions!")
-	t.Logf("📋 Contract A address: %s", contractAAddr.Hex())
-	t.Logf("📋 Contract B address: %s", contractBAddr.Hex())
-	t.Logf("📋 Calldata for triggerCall(): 0x%x", calldata)
+	t.Logf("Contract A address: %s", contractAAddr.Hex())
+	t.Logf("Contract B address: %s", contractBAddr.Hex())
+	t.Logf("Calldata for triggerCall(): 0x%x", calldata)
+}
+
+// TestTransactionPreExecWithCreateOpcode tests the eth_transactionPreExec RPC method with CREATE opcode
+// This deploys a factory contract and tests calling a function that creates another contract using CREATE opcode
+func TestTransactionPreExecWithCreateOpcode(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	ctx := context.Background()
+	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
+	require.NoError(t, err)
+
+	// Deploy the factory contract
+	privateKey, err := crypto.HexToECDSA(tmpSenderPrivateKey)
+	require.NoError(t, err)
+
+	publicKey := privateKey.Public()
+	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+	require.True(t, ok)
+	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
+
+	// Fund the deployment address
+	transToken(t, ctx, client, uint256.NewInt(1000000000000000000), fromAddress.String())
+
+	// Deploy ContractFactory - no constructor arguments needed
+	factoryAddr := deployContract(t, ctx, client, privateKey, "ContractFactory", constants.ContractFactoryABIJson, constants.ContractFactoryBytecodeStr)
+
+	// Generate calldata for createSimpleStorage(123) function
+	factoryABI, err := abi.JSON(strings.NewReader(constants.ContractFactoryABIJson))
+	require.NoError(t, err)
+	initialValue := big.NewInt(123)
+	calldata, err := factoryABI.Pack("createSimpleStorage", initialValue)
+	require.NoError(t, err)
+
+	// Create RPC client for calling eth_transactionPreExec
+	rpcClient, err := rpc.Dial(operations.DefaultL2NetworkURL, log.New())
+	require.NoError(t, err)
+	defer rpcClient.Close()
+
+	// Prepare the transaction for preexecution
+	fromAddr := common.HexToAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+	txRequest := map[string]interface{}{
+		"from":     fromAddr.Hex(),
+		"to":       factoryAddr.Hex(),
+		"gas":      "0x100000", // Higher gas limit for CREATE operations
+		"gasPrice": "0x4a817c800",
+		"value":    "0x0",
+		"nonce":    "0x1",
+		"data":     fmt.Sprintf("0x%x", calldata),
+	}
+
+	// State override to give the sender sufficient balance
+	stateOverride := map[string]interface{}{
+		fromAddr.Hex(): map[string]interface{}{
+			"balance": "0x1000000000000000000000",
+		},
+	}
+
+	var result json.RawMessage
+	err = rpcClient.Call(&result, "eth_transactionPreExec", []interface{}{txRequest}, "latest", stateOverride)
+	require.NoError(t, err)
+
+	// Parse the result
+	var preExecResults []map[string]interface{}
+	err = json.Unmarshal(result, &preExecResults)
+	require.NoError(t, err)
+	require.Len(t, preExecResults, 1, "Should have one result")
+
+	preExecResult := preExecResults[0]
+	t.Logf("CREATE PreExec Result: %+v", preExecResult)
+
+	// Check the execution result
+	if errorField, exists := preExecResult["error"]; exists && errorField != nil {
+		errorMap, ok := errorField.(map[string]interface{})
+		if ok {
+			if code, codeExists := errorMap["code"]; codeExists {
+				if codeFloat, isFloat := code.(float64); isFloat {
+					errorCode := int(codeFloat)
+					if errorCode != 0 {
+						t.Logf("CREATE PreExec returned error code %d: %v", errorCode, errorField)
+					}
+				}
+			}
+		}
+	}
+
+	// Verify inner transactions exist and contain CREATE opcode
+	if innerTxs, exists := preExecResult["innerTxs"]; exists {
+		innerTxList, ok := innerTxs.([]interface{})
+		require.True(t, ok, "innerTxs should be an array")
+		require.GreaterOrEqual(t, len(innerTxList), 1, "Should have at least 1 inner transaction")
+
+		t.Logf("Found %d inner transactions for CREATE test", len(innerTxList))
+		for i, innerTx := range innerTxList {
+			innerTxMap := innerTx.(map[string]interface{})
+			t.Logf("CREATE Inner Tx %d: %+v", i, innerTxMap)
+		}
+
+		// Check for CREATE transaction in inner transactions
+		foundCreate := false
+		for _, innerTx := range innerTxList {
+			innerTxMap := innerTx.(map[string]interface{})
+			if callType, exists := innerTxMap["call_type"]; exists {
+				if callType == "create" || callType == "create2" {
+					foundCreate = true
+					t.Logf("✅ Found CREATE transaction: %s", callType)
+
+					require.Equal(t, strings.ToLower(factoryAddr.Hex()), strings.ToLower(innerTxMap["from"].(string)), "CREATE should originate from factory contract")
+
+					if to, toExists := innerTxMap["to"]; toExists && to != nil {
+						createdAddr := to.(string)
+						t.Logf("✅ Contract created at address: %s", createdAddr)
+						require.NotEmpty(t, createdAddr, "Created contract address should not be empty")
+						require.NotEqual(t, "0x0000000000000000000000000000000000000000", strings.ToLower(createdAddr), "Created contract address should not be zero address")
+					}
+
+					if input, inputExists := innerTxMap["input"]; inputExists && input != nil {
+						inputStr := input.(string)
+						t.Logf("✅ CREATE input (constructor calldata): %s", inputStr)
+						require.NotEmpty(t, inputStr, "CREATE input should not be empty")
+						require.NotEqual(t, "0x", inputStr, "CREATE input should contain constructor data")
+					}
+
+					break
+				}
+			}
+		}
+
+		require.True(t, foundCreate, "Should have found at least one CREATE transaction")
+		t.Logf("✅ Successfully captured CREATE opcode inner transaction!")
+	} else {
+		t.Fatal("No inner transactions found in CREATE preexec result")
+	}
 
 }
