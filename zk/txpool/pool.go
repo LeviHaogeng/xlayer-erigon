@@ -381,11 +381,6 @@ func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, 
 		tracedSenders[common.BytesToAddress([]byte(sender))] = struct{}{}
 	}
 
-	hugeTxConfig := new(ethconfig.HugeTxConfig)
-	*hugeTxConfig = ethCfg.DeprecatedTxPool.HugeTxConfig
-	hugeTxConfigPtr := atomic.Pointer[ethconfig.HugeTxConfig]{}
-	hugeTxConfigPtr.Store(hugeTxConfig)
-
 	tp := &TxPool{
 		lock:                    &sync.RWMutex{},
 		byHash:                  map[string]*metaTx{},
@@ -425,12 +420,15 @@ func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, 
 			// For OkPay
 			OkPaySenderAccountsList:    ethCfg.DeprecatedTxPool.OkPaySenderAccountsList,
 			OkPayBlockPriorityTxsLimit: ethCfg.DeprecatedTxPool.OkPayBlockPriorityTxsLimit,
-
-			// For X Layer, Huge Tx Config
-			HugeTxConfig: hugeTxConfigPtr,
 		},
 		freeGasAddrs: map[string]bool{},
 	}
+
+	// For X Layer, Huge Tx Config
+	hugeTxConfig := new(ethconfig.HugeTxConfig)
+	*hugeTxConfig = ethCfg.DeprecatedTxPool.HugeTxConfig
+	tp.xlayerCfg.HugeTxConfig.Store(hugeTxConfig)
+
 	tp.setFreeGasList(ethCfg.DeprecatedTxPool.FreeGasList)
 
 	return tp, nil

@@ -51,7 +51,7 @@ func NewReadContext(txsMaxCount int, hugeTxMinimalGas, hugeTxGasQuota, totalAvai
 	// TODO: detect if include all txs, no matter if it's huge tx or not.
 	// if yes, reset hugeTxMinimalGas to max uint64 and hugeTxAvaliableGas to totalAvailableGas
 	return &readContext{
-		txs: make([]txRlp, txsMaxCount),
+		txs: make([]txRlp, 0, txsMaxCount),
 
 		txsMaxCount: txsMaxCount,
 
@@ -100,8 +100,8 @@ func (ctx *readContext) AddToSkipAndRemove(tx *metaTx) {
 }
 
 func (ctx *readContext) IsFullfilled() bool {
-	availableGas := len(ctx.txs) - len(ctx.outQuoteTxsIndex)
-	return availableGas >= ctx.txsMaxCount || ctx.totalAvailableGas < fixedgas.TxGas
+	availableTxs := len(ctx.txs) - len(ctx.outQuoteTxsIndex)
+	return availableTxs >= ctx.txsMaxCount || ctx.totalAvailableGas < fixedgas.TxGas
 }
 
 func (ctx *readContext) IsSkip(txId common.Hash) bool {
@@ -122,6 +122,7 @@ func (ctx *readContext) Finalize(txs *types.TxsRlp) int {
 		ctx.tryFullfill()
 	}
 
+	txs.Resize(uint(len(ctx.txs)))
 	count := 0
 	for _, tx := range ctx.txs {
 		if tx.isOutQuota {
@@ -135,35 +136,42 @@ func (ctx *readContext) Finalize(txs *types.TxsRlp) int {
 		count++
 	}
 
+	txs.Resize(uint(count))
 	return count
 }
 
 func (ctx *readContext) tryFullfill() {
-	for _, index := range ctx.outQuoteTxsIndex {
+	for i := 0; i < len(ctx.outQuoteTxsIndex); {
 		if ctx.IsFullfilled() {
 			break
 		}
 
-		if ctx.totalAvailableGas < ctx.txs[index].gasLimit {
+		txsIndex := ctx.outQuoteTxsIndex[i]
+
+		if ctx.totalAvailableGas < ctx.txs[txsIndex].gasLimit {
 			// we'd like to select a smaller one
+			i++
 			continue
 		}
-		ctx.totalAvailableGas -= ctx.txs[index].gasLimit
-		ctx.hugeTxGasUsage.outQuotaGasUsed -= ctx.txs[index].gasLimit
-		ctx.txs[index].isOutQuota = false
+		ctx.totalAvailableGas -= ctx.txs[txsIndex].gasLimit
+		ctx.hugeTxGasUsage.outQuotaGasUsed -= ctx.txs[txsIndex].gasLimit
+		ctx.txs[txsIndex].isOutQuota = false
 
-		ctx.AddToSkip(ctx.txs[index].TxId)
+		ctx.AddToSkip(ctx.txs[txsIndex].TxId)
+
+		// remove current value, so we don't increment index
+		ctx.outQuoteTxsIndex = append(ctx.outQuoteTxsIndex[:i], ctx.outQuoteTxsIndex[i+1:]...)
 	}
 }
 
 func (ctx *readContext) isHugeTx(gasLimit uint64) bool {
-	return gasLimit > ctx.hugeTxMinimalGas
+	return gasLimit >= ctx.hugeTxMinimalGas
 }
 
 func (ctx *readContext) processHugeTx(rlpTx []byte, txId common.Hash, sender common.Address, isLocal bool, gasLimit, intrinsicGas uint64) bool {
-	isOutQuote := ctx.hugeTxGasUsage.inQuotaGasLeft < gasLimit
+	isOutQuota := ctx.hugeTxGasUsage.inQuotaGasLeft < gasLimit
 
-	if isOutQuote {
+	if isOutQuota {
 		// quote of huge tx is not available, try to add it to out quote list
 		if ctx.totalAvailableGas < ctx.hugeTxGasUsage.outQuotaGasUsed {
 			// it's not necessary to add any more huge txs to out quote list.
@@ -173,13 +181,13 @@ func (ctx *readContext) processHugeTx(rlpTx []byte, txId common.Hash, sender com
 		ctx.hugeTxGasUsage.outQuotaGasUsed += gasLimit
 	} else {
 		// quote of huge tx is available, try to add it to in quote list
-		if !ctx.adjustTotalAvailableGas(intrinsicGas) {
+		if !ctx.adjustTotalAvailableGas(gasLimit) {
 			return false
 		}
 		ctx.hugeTxGasUsage.inQuotaGasLeft -= gasLimit
 	}
 
-	ctx.appendTx(rlpTx, txId, sender, isLocal, gasLimit, isOutQuote)
+	ctx.appendTx(rlpTx, txId, sender, isLocal, gasLimit, isOutQuota)
 	return true
 }
 
@@ -217,4 +225,5 @@ func (ctx *readContext) appendTx(rlpTx []byte, txId common.Hash, sender common.A
 	}
 
 	ctx.txs = append(ctx.txs, tx)
+	ctx.AddToSkip(txId)
 }
