@@ -19,7 +19,7 @@ import (
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/state"
 	"github.com/ledgerwatch/erigon/core/types"
-	"github.com/ledgerwatch/erigon/core/types/accounts"
+
 	"github.com/ledgerwatch/erigon/core/vm"
 	"github.com/ledgerwatch/erigon/eth/tracers"
 	"github.com/ledgerwatch/erigon/rpc"
@@ -873,16 +873,30 @@ func preArgsCheck(ibs *state.IntraBlockState, arg PreArgs) error {
 		return fmt.Errorf("EIP-7702 transactions are not supported: authorizationList should not be set")
 	}
 
-	// Note: Nonce validation is now handled in the main transaction loop
-	// to support strict sequential nonce checking across batch transactions
-
-	// Make sure the sender is an EOA (not a contract)
+	// 从pending高度获取state时，需要校验nonce
 	msgFrom := *arg.From
-	codeHash := ibs.GetCodeHash(msgFrom)
-	if !accounts.IsEmptyCodeHash(codeHash) {
-		return fmt.Errorf("sender not EOA: address %v, codehash: %s",
-			msgFrom.Hex(), codeHash.Hex())
+	msgNonce := uint64(*arg.Nonce)
+	stNonce := ibs.GetNonce(msgFrom)
+	/*if stNonce < msgNonce {
+		return fmt.Errorf("%w: address %v, tx: %d state: %d", core.ErrNonceTooHigh,
+			msgFrom.Hex(), msgNonce, stNonce)
+	}*/
+	if stNonce > msgNonce {
+		return fmt.Errorf("%w: address %v, tx: %d state: %d", core.ErrNonceTooLow,
+			msgFrom.Hex(), msgNonce, stNonce)
+	} else if stNonce+1 < stNonce {
+		return fmt.Errorf("%w: address %v, nonce: %d", core.ErrNonceMax,
+			msgFrom.Hex(), stNonce)
 	}
 
+	// skip check account
+	// make sure the sender is an EOA
+	/*
+		codeHash := ibs.GetCodeHash(msgFrom)
+		if codeHash != (common.Hash{}) && !accounts.IsEmptyCodeHash(codeHash) {
+			return fmt.Errorf("%w: address %v, codehash: %s", core.ErrSenderNoEOA,
+				msgFrom.Hex(), codeHash.Hex())
+		}
+	*/
 	return nil
 }
