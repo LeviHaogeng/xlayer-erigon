@@ -70,6 +70,7 @@ type PreArgs struct {
 	Nonce                *hexutil.Uint64   `json:"nonce"`
 	Data                 *hexutility.Bytes `json:"data"`
 	Input                *hexutility.Bytes `json:"input"`
+	AuthorizationList    []interface{}     `json:"authorizationList,omitempty"`
 }
 
 func (args PreArgs) ToLogString() string {
@@ -183,7 +184,7 @@ func toPreResult(innerTxs []*PreExecInnerTx, logs []*types.Log, stateDiff map[st
 }
 
 // TransactionPreExec executes multiple transactions in sequence and returns their execution results
-func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, blockNrOrHash *rpc.BlockNumberOrHash, stateOverrides *ethapi.StateOverrides) ([]PreResult, error) {
+func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, blockNrOrHash *rpc.BlockNumberOrHash, stateOverrides *ethapi.FlexibleStateOverrides) ([]PreResult, error) {
 	start := time.Now()
 	requestID := uuid.NewString()
 	defer func(s time.Time, id string) {
@@ -235,8 +236,9 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, b
 
 	// Apply state overrides if provided
 	if stateOverrides != nil {
-		log.Info("TransactionPreExec: applying state overrides", "requestID", requestID, "overrides", len(*stateOverrides))
-		err = stateOverrides.Override(ibs)
+		log.Info("TransactionPreExec: applying flexible state overrides", "requestID", requestID, "overrides", len(*stateOverrides))
+		adapter := &ethapi.IntraBlockStateAdapter{IntraBlockState: ibs}
+		err = stateOverrides.Override(adapter)
 		if err != nil {
 			return nil, err
 		}
@@ -706,17 +708,23 @@ func convertCallTracerResultToInnerTxs(traceResult interface{}) (result []*PreEx
 		returnGas = gasUint64 - gasUsedUint64
 	}
 
+	// Handle empty output - ensure it's "0x" instead of ""
+	output := callTx.Output
+	if output == "" {
+		output = "0x"
+	}
+
 	innerTx := &PreExecInnerTx{
 		Dept:          *big.NewInt(0),
 		InternalIndex: *big.NewInt(int64(0)),
 		CallType:      strings.ToLower(callTx.Type),
 		Name:          strings.ToLower(callTx.Type),
-		TraceAddress:  "0",
+		TraceAddress:  "",
 		CodeAddress:   "",
-		From:          callTx.From,
-		To:            callTx.To,
+		From:          common.HexToAddress(callTx.From).Hex(), // Convert to checksummed address
+		To:            common.HexToAddress(callTx.To).Hex(),   // Convert to checksummed address
 		Input:         callTx.Input,
-		Output:        callTx.Output,
+		Output:        output, // Use processed output
 		IsError:       isError,
 		GasUsed:       gasUsedUint64,
 		Value:         valueWei,
@@ -773,6 +781,12 @@ func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepth
 			returnGas = gasUint64 - gasUsedUint64
 		}
 
+		// Handle empty output - ensure it's "0x" instead of ""
+		output := callTx.Output
+		if output == "" {
+			output = "0x"
+		}
+
 		innerTx := &PreExecInnerTx{
 			Dept:          *big.NewInt(depth),
 			InternalIndex: *big.NewInt(int64(index)),
@@ -780,10 +794,10 @@ func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepth
 			Name:          "",
 			TraceAddress:  "",
 			CodeAddress:   "",
-			From:          callTx.From,
-			To:            callTx.To,
+			From:          common.HexToAddress(callTx.From).Hex(), // Convert to checksummed address
+			To:            common.HexToAddress(callTx.To).Hex(),   // Convert to checksummed address
 			Input:         callTx.Input,
-			Output:        callTx.Output,
+			Output:        output, // Use processed output
 			IsError:       isError,
 			GasUsed:       gasUsedUint64,
 			Value:         valueWei,
@@ -794,7 +808,7 @@ func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepth
 
 		// if CallType == "callcode", CodeAddress = callTx.To
 		if strings.ToLower(callTx.Type) == "callcode" {
-			innerTx.CodeAddress = callTx.To
+			innerTx.CodeAddress = common.HexToAddress(callTx.To).Hex() // Convert to checksummed address
 		}
 
 		// 记录深度
@@ -802,11 +816,11 @@ func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepth
 		// set name
 		innerTx.Name = fmt.Sprintf("%s%s", innerTx.CallType, depthIndexRoot)
 		// set trace address
-		if lastDepthIndexRoot == "" {
-			innerTx.TraceAddress = fmt.Sprintf("%d", index)
-		} else {
-			innerTx.TraceAddress = fmt.Sprintf("%s,%d", strings.ReplaceAll(lastDepthIndexRoot, "_", ","), index)
-		}
+		// if lastDepthIndexRoot == "" {
+		// 	innerTx.TraceAddress = fmt.Sprintf("%d", index)
+		// } else {
+		// 	innerTx.TraceAddress = fmt.Sprintf("%s,%d", strings.ReplaceAll(lastDepthIndexRoot, "_", ","), index)
+		// }
 
 		result = append(result, innerTx)
 		if len(callTx.Calls) > 0 {
@@ -836,24 +850,16 @@ func preArgsCheck(ibs *state.IntraBlockState, arg PreArgs) error {
 		return fmt.Errorf("EIP-1559 transactions are not supported: maxFeePerGas and maxPriorityFeePerGas should not be set")
 	}
 
-	// Validate nonce against current state
-	msgFrom := *arg.From
-	msgNonce := uint64(*arg.Nonce)
-	stNonce := ibs.GetNonce(msgFrom)
-
-	// Check if nonce is too low
-	if stNonce > msgNonce {
-		return fmt.Errorf("nonce too low: address %v, tx: %d state: %d",
-			msgFrom.Hex(), msgNonce, stNonce)
+	// Check for EIP-7702 transaction fields - not supported
+	if len(arg.AuthorizationList) > 0 {
+		return fmt.Errorf("EIP-7702 transactions are not supported: authorizationList should not be set")
 	}
 
-	// Check for nonce overflow
-	if stNonce+1 < stNonce {
-		return fmt.Errorf("nonce max exceeded: address %v, nonce: %d",
-			msgFrom.Hex(), stNonce)
-	}
+	// Note: Nonce validation is now handled in the main transaction loop
+	// to support strict sequential nonce checking across batch transactions
 
 	// Make sure the sender is an EOA (not a contract)
+	msgFrom := *arg.From
 	codeHash := ibs.GetCodeHash(msgFrom)
 	if !accounts.IsEmptyCodeHash(codeHash) {
 		return fmt.Errorf("sender not EOA: address %v, codehash: %s",
