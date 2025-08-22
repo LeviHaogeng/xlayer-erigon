@@ -391,5 +391,7 @@ var DefaultFlags = []cli.Flag{
 	&utils.BridgeInterceptMaxBridgeAmount,
 	&utils.BridgeInterceptWhitelistEnabled,
 	&utils.BridgeInterceptWhitelistAddresses,
+	&utils.DynamicBlockGasLimit,
 	&utils.EnableLatestDataStreamBlockNumberGlobalVariableForRpc,
+	&utils.DataStreamUnwindToBlock,
 }

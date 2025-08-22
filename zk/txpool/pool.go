@@ -690,7 +690,7 @@ func (p *TxPool) IdHashKnown(tx kv.Tx, hash []byte) (bool, error) {
 	// For X Layer, optimize tx pool
 	p.lock.RLock()
 	defer p.lock.RUnlock()
-	if _, ok := p.discardReasonsLRU.Get(string(hash)); ok {
+	if p.discardReasonsLRU.Contains(string(hash)) {
 		return true, nil
 	}
 	if _, ok := p.unprocessedRemoteByHash[string(hash)]; ok {
@@ -800,7 +800,8 @@ func (p *TxPool) validateTx(txn *types.TxSlot, isLocal bool, stateCache kvcache.
 		}
 		return IntrinsicGas
 	}
-	if txn.Gas > transactionGasLimit {
+	// For X Layer, check if gas limit is higher than the dynamic block gas limit
+	if txn.Gas > p.ethCfg.Zk.XLayer.DynamicBlockGasLimit {
 		if txn.Traced {
 			log.Info(fmt.Sprintf("TX TRACING: validateTx gas limit too high idHash=%x gas=%d, limit=%d", txn.IDHash, txn.Gas, transactionGasLimit))
 		}
@@ -1336,8 +1337,8 @@ func (p *TxPool) discardLocked(mt *metaTx, reason DiscardReason) {
 
 func (p *TxPool) NonceFromAddress(addr [20]byte) (nonce uint64, inPool bool) {
 	// For X Layer, optimize tx pool
-	p.lock.RLock()
-	defer p.lock.RUnlock()
+	p.lock.Lock()
+	defer p.lock.Unlock()
 	senderID, found := p.senders.getID(addr)
 	if !found {
 		return 0, false
