@@ -752,6 +752,27 @@ func TestTransactionPreExecInnerTransaction(t *testing.T) {
 		require.True(t, name[len(name)-1] >= '0' && name[len(name)-1] <= '9')
 		require.False(t, secondInnerTx["is_error"].(bool), "Expected is_error to be false for the second inner transaction")
 	}
+
+	transferTx := map[string]interface{}{
+		"from": fromAddr.Hex(), "to": "0x742d35Cc4cF52f9234E96bC29d7F6a0c91d87b06",
+		"value": "0x1000000000000000", "gas": "0x5208",
+		"gasPrice": "0x4a817c800", "nonce": "0x2",
+	}
+
+	var transferResult json.RawMessage
+	err = rpcClient.Call(&transferResult, "eth_transactionPreExec", []interface{}{transferTx}, "latest", nil)
+	require.NoError(t, err)
+
+	var transferResults []map[string]interface{}
+	err = json.Unmarshal(transferResult, &transferResults)
+	require.NoError(t, err)
+	require.Len(t, transferResults, 1)
+
+	transferInnerTxs, ok := transferResults[0]["innerTxs"].([]interface{})
+	require.True(t, ok, "innerTxs should be an array for simple transfers")
+	require.Empty(t, transferInnerTxs, "innerTxs should be empty array for simple transfers (dept == 0)")
+
+	t.Logf("✅ Simple transfer validation: innerTxs count = %d (expected: 0)", len(transferInnerTxs))
 }
 
 // TestTransactionPreExecWithCreateOpcode tests the eth_transactionPreExec RPC method with CREATE opcode
