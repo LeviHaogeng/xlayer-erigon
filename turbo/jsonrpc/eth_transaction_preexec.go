@@ -669,7 +669,9 @@ func convertPrestateToStateDiff(traceResult interface{}) map[string]interface{} 
 				}
 			*/
 
-			result[addr] = addrMap
+			// Convert address to EIP-55 checksummed format
+			checksummedAddr := common.HexToAddress(addr).Hex()
+			result[checksummedAddr] = addrMap
 		}
 	}
 
@@ -744,11 +746,12 @@ func convertCallTracerResultToInnerTxs(traceResult interface{}) (result []*PreEx
 		Input:         callTx.Input,
 		Output:        output, // Use processed output
 		IsError:       isError,
-		GasUsed:       gasUsedUint64,
-		Value:         valueWei,
-		ValueWei:      valueWei,
-		Error:         errorMsg,
-		ReturnGas:     returnGas,
+		// GasUsed:       gasUsedUint64, // For historical reason, we use gasUint64 here
+		GasUsed:   gasUint64,
+		Value:     valueWei,
+		ValueWei:  valueWei,
+		Error:     errorMsg,
+		ReturnGas: returnGas,
 	}
 	result = append(result, innerTx)
 	if len(callTx.Calls) > 0 {
