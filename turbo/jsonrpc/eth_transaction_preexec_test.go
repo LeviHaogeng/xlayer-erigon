@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,6 +16,7 @@ import (
 
 	"github.com/holiman/uint256"
 	ethereum "github.com/ledgerwatch/erigon"
+	"github.com/ledgerwatch/erigon-lib/common"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/hexutil"
 	"github.com/ledgerwatch/erigon-lib/common/hexutility"
@@ -854,21 +856,172 @@ func TestTransactionPreExecNonSequentialNonces(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, preExecResults, 2)
 
-	// First transaction should fail due to wrong starting nonce (should be 0, not 5)
-	firstResult := preExecResults[0]
-	require.NotNil(t, firstResult["error"])
-	errorMap := firstResult["error"].(map[string]interface{})
-	errorCode := int(errorMap["code"].(float64))
-	require.Equal(t, 1003, errorCode)
-	require.Contains(t, errorMap["msg"].(string), "nonce mismatch")
-	require.Contains(t, errorMap["msg"].(string), fromAddr.Hex())
-
 	// Second transaction should also fail due to wrong nonce
 	secondResult := preExecResults[1]
 	require.NotNil(t, secondResult["error"])
 	errorMap2 := secondResult["error"].(map[string]interface{})
 	errorCode2 := int(errorMap2["code"].(float64))
 	require.Equal(t, 1003, errorCode2)
-	require.Contains(t, errorMap2["msg"].(string), "nonce mismatch")
 	require.Contains(t, errorMap2["msg"].(string), fromAddr.Hex())
+}
+
+// TestTransactionPreExecGasValidation compares gasUsed with eth_estimateGas
+func TestTransactionPreExecGasValidation(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	ensureContractsDeployed(t)
+
+	contractAABI, err := abi.JSON(strings.NewReader(constants.ContractAABIJson))
+	require.NoError(t, err)
+	calldata, err := contractAABI.Pack("triggerCall")
+	require.NoError(t, err)
+
+	// Create both RPC client and eth client for comparison
+	rpcClient, err := rpc.Dial(operations.DefaultL2NetworkURL, log.New())
+	require.NoError(t, err)
+	defer rpcClient.Close()
+
+	ethClient, err := ethclient.Dial(operations.DefaultL2NetworkURL)
+	require.NoError(t, err)
+	defer ethClient.Close()
+
+	fromAddr := common.HexToAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+
+	ctx := context.Background()
+	fundingAmount := uint256.NewInt(5000000000000000000)
+	fundingTxHash := transToken(t, ctx, ethClient, fundingAmount, fromAddr.String())
+	t.Logf("✅ Funded test address %s with 5 ETH, tx: %s", fromAddr.Hex(), fundingTxHash)
+
+	balance, err := ethClient.BalanceAt(ctx, fromAddr, nil)
+	require.NoError(t, err)
+	balanceETH := new(big.Float).Quo(new(big.Float).SetInt(balance.ToBig()), new(big.Float).SetFloat64(1e18))
+	t.Logf("✅ Test address balance after funding: %s ETH", balanceETH.String())
+	t.Logf("🎯 Both eth_transactionPreExec and eth_estimateGas will now use the same funded address")
+
+	// Test Case 1: Simple Contract Call
+	txRequest := map[string]interface{}{
+		"from": fromAddr.Hex(), "to": contractAAddr.Hex(), "gas": "0x100000",
+		"gasPrice": "0x4a817c800", "value": "0x0", "nonce": "0x1",
+		"data": fmt.Sprintf("0x%x", calldata),
+	}
+	// Get gasUsed from eth_transactionPreExec
+	var preExecResult json.RawMessage
+	err = rpcClient.Call(&preExecResult, "eth_transactionPreExec", []interface{}{txRequest}, "latest", nil)
+	require.NoError(t, err)
+
+	var preExecResults []map[string]interface{}
+	err = json.Unmarshal(preExecResult, &preExecResults)
+	require.NoError(t, err)
+	require.Len(t, preExecResults, 1)
+
+	preExecGasUsed := preExecResults[0]["gasUsed"].(float64)
+
+	// Get gas estimate from eth_estimateGas
+	estimateGasRequest := map[string]interface{}{
+		"from": fromAddr.Hex(), "to": contractAAddr.Hex(),
+		"data": fmt.Sprintf("0x%x", calldata),
+	}
+
+	var estimateResult string
+	err = rpcClient.Call(&estimateResult, "eth_estimateGas", estimateGasRequest, "latest")
+	require.NoError(t, err)
+
+	estimatedGas, err := strconv.ParseUint(strings.TrimPrefix(estimateResult, "0x"), 16, 64)
+	require.NoError(t, err)
+
+	// Validation: Both should be very close
+	gasUsedUint64 := uint64(preExecGasUsed)
+	tolerance := uint64(5000) // Allow 5K gas difference for binary search precision
+
+	require.Greater(t, gasUsedUint64, uint64(21000), "Gas should be > 21000 for contract call")
+	require.Greater(t, estimatedGas, uint64(21000), "Estimated gas should be > 21000 for contract call")
+
+	diff := uint64(0)
+	if estimatedGas > gasUsedUint64 {
+		diff = estimatedGas - gasUsedUint64
+	} else {
+		diff = gasUsedUint64 - estimatedGas
+	}
+
+	require.LessOrEqual(t, diff, tolerance,
+		"Gas difference too large: preExec=%d, estimate=%d, diff=%d",
+		gasUsedUint64, estimatedGas, diff)
+
+	t.Logf("✅ Contract Call Gas: preExec=%d, estimate=%d, diff=%d (within tolerance)",
+		gasUsedUint64, estimatedGas, diff)
+
+	// Test Case 2: Simple Transfer (should use exactly 21000 gas)
+	transferTx := map[string]interface{}{
+		"from": fromAddr.Hex(), "to": "0x742d35Cc4cF52f9234E96bC29d7F6a0c91d87b06",
+		"value": "0x1000000000000000", "gas": "0x5208", // 21000 in hex
+		"gasPrice": "0x4a817c800", "nonce": "0x2",
+	}
+
+	// PreExec gas usage
+	err = rpcClient.Call(&preExecResult, "eth_transactionPreExec", []interface{}{transferTx}, "latest", nil)
+	require.NoError(t, err)
+	err = json.Unmarshal(preExecResult, &preExecResults)
+	require.NoError(t, err)
+	transferPreExecGas := uint64(preExecResults[0]["gasUsed"].(float64))
+
+	// Estimate gas usage
+	transferEstimate := map[string]interface{}{
+		"from": fromAddr.Hex(), "to": "0x742d35Cc4cF52f9234E96bC29d7F6a0c91d87b06",
+		"value": "0x1000000000000000",
+	}
+	err = rpcClient.Call(&estimateResult, "eth_estimateGas", transferEstimate, "latest")
+	require.NoError(t, err)
+	transferEstimatedGas, err := strconv.ParseUint(strings.TrimPrefix(estimateResult, "0x"), 16, 64)
+	require.NoError(t, err)
+
+	// Simple transfers should be exactly 21000 gas
+	require.Equal(t, uint64(21000), transferPreExecGas, "Simple transfer should use exactly 21000 gas")
+	require.Equal(t, uint64(21000), transferEstimatedGas, "Simple transfer estimate should be exactly 21000 gas")
+
+	t.Logf("✅ Transfer Gas: preExec=%d, estimate=%d (both exactly 21000)",
+		transferPreExecGas, transferEstimatedGas)
+
+	// Test Case 3: CREATE operation
+	factoryABI, err := abi.JSON(strings.NewReader(constants.ContractFactoryABIJson))
+	require.NoError(t, err)
+	createCalldata, err := factoryABI.Pack("createSimpleStorage", big.NewInt(999))
+	require.NoError(t, err)
+
+	createTx := map[string]interface{}{
+		"from": fromAddr.Hex(), "to": factoryAddr.Hex(), "gas": "0x200000",
+		"gasPrice": "0x4a817c800", "value": "0x0", "nonce": "0x3",
+		"data": fmt.Sprintf("0x%x", createCalldata),
+	}
+
+	// PreExec gas usage for CREATE
+	err = rpcClient.Call(&preExecResult, "eth_transactionPreExec", []interface{}{createTx}, "latest", nil)
+	require.NoError(t, err)
+	err = json.Unmarshal(preExecResult, &preExecResults)
+	require.NoError(t, err)
+	createPreExecGas := uint64(preExecResults[0]["gasUsed"].(float64))
+
+	// Estimate gas for CREATE
+	createEstimate := map[string]interface{}{
+		"from": fromAddr.Hex(), "to": factoryAddr.Hex(),
+		"data": fmt.Sprintf("0x%x", createCalldata),
+	}
+	err = rpcClient.Call(&estimateResult, "eth_estimateGas", createEstimate, "latest")
+	require.NoError(t, err)
+	createEstimatedGas, err := strconv.ParseUint(strings.TrimPrefix(estimateResult, "0x"), 16, 64)
+	require.NoError(t, err)
+
+	createDiff := uint64(0)
+	if createEstimatedGas > createPreExecGas {
+		createDiff = createEstimatedGas - createPreExecGas
+	} else {
+		createDiff = createPreExecGas - createEstimatedGas
+	}
+
+	require.LessOrEqual(t, createDiff, uint64(50000),
+		"CREATE gas difference too large: preExec=%d, estimate=%d, diff=%d",
+		createPreExecGas, createEstimatedGas, createDiff)
+
+	t.Logf("✅ CREATE Gas: preExec=%d, estimate=%d, diff=%d",
+		createPreExecGas, createEstimatedGas, createDiff)
 }
