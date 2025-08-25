@@ -31,7 +31,7 @@ func getNextPoolTransactions(ctx context.Context, cfg SequenceBlockCfg, executio
 	var err error
 
 	//gasLimit := utils.GetBlockGasLimitForFork(forkId)
-	gasLimit := utils.GetBlockGasLimit() // For X Layer, use the block gas limit
+	gasLimit := cfg.zk.XLayer.DynamicBlockGasLimit // For X Layer, use the dynamicblock gas limit
 
 	ti := utils.StartTimer("txpool", "get-transactions")
 	defer ti.LogTimer()
@@ -221,7 +221,7 @@ func attemptAddTransaction(
 	// if not normalcy we want to create a gas pool per transaction (zkevm block gas limit is infinite), if normalcy create a pool per block.
 	var gasPool *core.GasPool
 	if !cfg.chainConfig.IsNormalcy(blockContext.BlockNumber) {
-		gasPool = new(core.GasPool).AddGas(transactionGasLimit)
+		gasPool = new(core.GasPool).AddGas(cfg.zk.XLayer.DynamicBlockGasLimit)
 	} else {
 		gasPool = ethBlockGasPool
 	}
@@ -277,7 +277,8 @@ func attemptAddTransaction(
 		return nil, nil, nil, overflowGas, nil
 	}
 
-	if gasUsed > utils.GetBlockGasLimit() {
+	// For X Layer, check if the transaction overflows the dynamic block gas limit
+	if gasUsed > cfg.zk.XLayer.DynamicBlockGasLimit {
 		log.Info("Transaction overflows block gas limit", "txHash", transaction.Hash(), "txGas", receipt.GasUsed, "blockGasUsed", header.GasUsed)
 		ibs.RevertToSnapshot(snapshot)
 		return nil, nil, nil, overflowGas, nil
