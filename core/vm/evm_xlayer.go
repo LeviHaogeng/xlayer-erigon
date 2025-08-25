@@ -97,17 +97,13 @@ func beforeOp(
 	return innerTx, newIndex
 }
 
-func afterOp(interpreter *EVMInterpreter, opType string, gas_used uint64, newIndex int, innerTx *zktypes.InnerTx, addr *libcommon.Address, err error, ret []byte) {
+func afterOp(interpreter *EVMInterpreter, opType string, gas_used uint64, newIndex int, innerTx *zktypes.InnerTx, addr *libcommon.Address, err error) {
 	innerTx.GasUsed = gas_used
-	if len(ret) > 0 {
-		innerTx.Output = hexutility.Encode(ret[:])
-	}
 	if err != nil {
 		innerTxMeta := interpreter.evm.GetInnerTxMeta()
-		for _, itx := range innerTxMeta.InnerTxs[newIndex:] {
-			itx.IsError = true
+		for _, innerTx := range innerTxMeta.InnerTxs[newIndex:] {
+			innerTx.IsError = true
 		}
-		innerTx.Error = err.Error()
 	}
 
 	switch opType {
