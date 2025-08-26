@@ -158,6 +158,8 @@ const (
 	NoWhiteListedSender         DiscardReason = 128 // the transaction is sent by a non-whitelisted account
 )
 
+const logPrefix = "txpool"
+
 func (r DiscardReason) String() string {
 	switch r {
 	case NotSet:
@@ -343,6 +345,7 @@ type TxPool struct {
 	apolloCfg    ApolloConfig
 	gpCache      GPCache // GPCache will only work in sequencer node, without rpc node
 	freeGasAddrs map[string]bool
+	readContext  *readContext
 
 	// we cannot be in a flushing state whilst getting transactions from the pool, so we have this mutex which is
 	// exposed publicly so anything wanting to get "best" transactions can ensure a flush isn't happening and

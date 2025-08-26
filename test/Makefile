@@ -232,6 +232,123 @@ lint:
 	cd ../docs/endpoints && make check-doc
 	echo "Lint passed"
 
+.PHONY: test-hugetx-e2e
+test-hugetx-e2e: hugetx-s1 hugetx-s2 hugetx-s3 hugetx-s4 hugetx-s5 hugetx-s6 hugetx-s7
+	echo "HugeTx E2E tests passed"
+
+# helper to update huge-tx config in YAML (create keys if missing, then set values)
+HUGETX_CFG_FILE := config/test.erigon.seq.config.yaml
+
+define set_hugetx_cfg
+    @file=$(HUGETX_CFG_FILE); \
+    key1="txpool.huge-tx-threshold-ratio"; \
+    key2="txpool.huge-tx-quota-ratio"; \
+    key3="txpool.ignore-huge-tx-quota-interval"; \
+    key4="zkevm.dynamic-block-gas-limit"; \
+    for k in $$key1 $$key2 $$key3 $$key4; do \
+      if grep -q "^$$k:" $$file; then :; else echo "$$k: 0" >> $$file; fi; \
+    done; \
+    sed -i.bak -e "s/^$$key1:.*/$$key1: $(1)/" $$file; \
+    sed -i.bak -e "s/^$$key2:.*/$$key2: $(2)/" $$file; \
+    sed -i.bak -e "s/^$$key3:.*/$$key3: $(3)/" $$file; \
+    sed -i.bak -e "s/^$$key4:.*/$$key4: $(4)/" $$file; \
+    rm -f $$file.bak; \
+    echo "Updated $$file with threshold=$(1) quota=$(2) ignore=$(3) dynamic-gas=$(4)"; \
+    tail -n 8 $$file
+endef
+
+.PHONY: set_seal_time
+define set_seal_time
+	@file=$(HUGETX_CFG_FILE); \
+	key="zkevm.sequencer-block-seal-time"; \
+	key2="zkevm.sequencer-max-block-seal-time"; \
+	key3="zkevm.sequencer-batch-seal-time"; \
+	val="$(1)"; \
+	num=$${val%[a-zA-Z]*}; \
+	unit=$${val#$$num}; \
+	max="$$(($$num*2))$$unit"; \
+	batch="$$(($$num*3))$$unit"; \
+	if grep -q "^$$key:" $$file; then :; else echo "$$key: \"$$val\"" >> $$file; fi; \
+	if grep -q "^$$key2:" $$file; then :; else echo "$$key2: \"$$max\"" >> $$file; fi; \
+	if grep -q "^$$key3:" $$file; then :; else echo "$$key3: \"$$batch\"" >> $$file; fi; \
+	sed -i.bak \
+		-e "s/^$$key:.*/$$key: \"$$val\"/" \
+		-e "s/^$$key2:.*/$$key2: \"$$max\"/" \
+		-e "s/^$$key3:.*/$$key3: \"$$batch\"/" $$file; \
+	rm -f $$file.bak; \
+	echo "Set $$key=$$val, $$key2=$$max, $$key3=$$batch in $$file"; \
+	tail -n 15 $$file
+endef
+
+.PHONY: hugetx-s1
+hugetx-s1:
+	make stop
+	make run
+	sleep 5
+	$(STOP_DOCKER_SEQ)
+	$(call set_hugetx_cfg,5,10,5,2100000)
+	$(call set_seal_time,8s)
+	$(RUN_DOCKER_SEQ)
+	sleep 10
+	trap '$(STOP) git checkout -- $(HUGETX_CFG_FILE)' EXIT; MallocNanoZone=0 go test -tags hugetx -count=1 -failfast -race -v -p 1 -timeout 600s ./e2e/... -run ^TestHugeTxE2E_S1_
+
+.PHONY: hugetx-s2
+hugetx-s2:
+	make stop
+	make run
+	sleep 5
+	$(STOP_DOCKER_SEQ)
+	$(call set_hugetx_cfg,5,50,5,2100000)
+	$(call set_seal_time,8s)
+	$(RUN_DOCKER_SEQ)
+	sleep 10
+	trap '$(STOP) git checkout -- $(HUGETX_CFG_FILE)' EXIT; MallocNanoZone=0 go test -tags hugetx -count=1 -failfast -race -v -p 1 -timeout 600s ./e2e/... -run ^TestHugeTxE2E_S2_
+
+.PHONY: hugetx-s3
+hugetx-s3:
+	make stop
+	make run
+	sleep 5
+	$(STOP_DOCKER_SEQ)
+	$(call set_hugetx_cfg,5,50,50000,2100000)
+	$(call set_seal_time,8s)
+	$(RUN_DOCKER_SEQ)
+	sleep 10
+	trap '$(STOP) git checkout -- $(HUGETX_CFG_FILE)' EXIT; MallocNanoZone=0 go test -tags hugetx -count=1 -failfast -race -v -p 1 -timeout 600s ./e2e/... -run ^TestHugeTxE2E_S3_
+
+.PHONY: hugetx-s4
+hugetx-s4:
+	make stop
+	$(call set_hugetx_cfg,5,50,5)
+	make run
+	sleep 10
+	trap '$(STOP)' EXIT; MallocNanoZone=0 go test -tags hugetx -count=1 -failfast -race -v -p 1 -timeout 600s ./e2e/... -run ^TestHugeTxE2E_S4_
+
+.PHONY: hugetx-s5
+hugetx-s5:
+	make stop
+	$(call set_hugetx_cfg,5,100,5)
+	make run
+	sleep 10
+	trap '$(STOP)' EXIT; MallocNanoZone=0 go test -tags hugetx -count=1 -failfast -race -v -p 1 -timeout 600s ./e2e/... -run ^TestHugeTxE2E_S5_
+
+.PHONY: hugetx-s6
+hugetx-s6:
+	make stop
+	$(call set_hugetx_cfg,5,0,5)
+	make run
+	sleep 10
+	trap '$(STOP)' EXIT; MallocNanoZone=0 go test -tags hugetx -count=1 -failfast -race -v -p 1 -timeout 600s ./e2e/... -run ^TestHugeTxE2E_S6_
+
+.PHONY: hugetx-s7
+hugetx-s7:
+	make stop
+	$(call set_hugetx_cfg,5,20,0)
+	make run
+	sleep 10
+	trap '$(STOP)' EXIT; MallocNanoZone=0 go test -tags hugetx -count=1 -failfast -race -v -p 1 -timeout 600s ./e2e/... -run ^TestHugeTxE2E_S7_
+
+
 .PHONY: test-e2e
 test-e2e: stop all ## Runs group xlayer feature e2e tests checking race conditions
 	sleep 3

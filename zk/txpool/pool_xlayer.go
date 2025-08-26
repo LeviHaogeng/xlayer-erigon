@@ -22,6 +22,7 @@ import (
 	"github.com/ledgerwatch/erigon/eth/ethconfig"
 	"github.com/ledgerwatch/erigon/zk/apollo"
 	"github.com/ledgerwatch/erigon/zkevm/hex"
+	"github.com/ledgerwatch/log/v3"
 )
 
 // free gas tx type
@@ -87,6 +88,7 @@ type GPCache interface {
 
 func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
 	removeWG.Wait()
+	log.Debug(fmt.Sprintf("[%s]bestForXLayer", logPrefix), "n", n, "onTopOf", onTopOf, "nextBlockNumber", nextBlockNumber, "availableGas", availableGas, "availableBlobGas", availableBlobGas)
 
 	if p.isDeniedYieldingTransactions() {
 		//log.Trace("Denied yielding transactions, cannot proceed")
@@ -116,14 +118,23 @@ func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, n
 
 	best := p.pending.best
 
-	readContext := NewReadContext(
-		cmp.Min(int(n), len(best.ms)),
-		hugeTxMinimalGas,
-		hugeTxQuotaGas,
-		availableGas,
-		availableBlobGas,
-		toSkip,
-	)
+	txsMaxCount := cmp.Min(int(n), len(best.ms))
+
+	var readContext *readContext
+	if p.readContext != nil && p.readContext.isSameBlockNumber(nextBlockNumber) {
+		readContext = p.readContext
+		readContext.resetRead(txsMaxCount, availableGas, availableBlobGas)
+	} else {
+		readContext = NewReadContext(
+			nextBlockNumber,
+			txsMaxCount,
+			hugeTxMinimalGas,
+			hugeTxQuotaGas,
+			availableGas,
+			availableBlobGas,
+			toSkip,
+		)
+	}
 
 	p.pending.EnforceBestInvariants()
 
@@ -187,7 +198,7 @@ func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *readC
 		mt := best.ms[i]
 		//log.Trace("Processing transaction", "txID", mt.Tx.IDHash)
 
-		if readContext.IsSkip(mt.Tx.IDHash) {
+		if readContext.IsSkip(&mt.Tx.IDHash) {
 			//log.Trace("Skipping transaction, already in toSkip", "txID", mt.Tx.IDHash)
 			continue
 		}

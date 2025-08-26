@@ -1,12 +1,14 @@
 package txpool
 
 import (
+	"fmt"
 	"math"
 
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/fixedgas"
 	"github.com/ledgerwatch/erigon-lib/types"
+	"github.com/ledgerwatch/log/v3"
 )
 
 type txRlp struct {
@@ -45,11 +47,11 @@ type readContext struct {
 
 	toSkip   mapset.Set[[32]byte]
 	toRemove []*metaTx
+
+	blockNumber uint64
 }
 
-func NewReadContext(txsMaxCount int, hugeTxMinimalGas, hugeTxGasQuota, totalAvailableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) *readContext {
-	// TODO: detect if include all txs, no matter if it's huge tx or not.
-	// if yes, reset hugeTxMinimalGas to max uint64 and hugeTxAvaliableGas to totalAvailableGas
+func NewReadContext(blockNumber uint64, txsMaxCount int, hugeTxMinimalGas, hugeTxGasQuota, totalAvailableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) *readContext {
 	return &readContext{
 		txs: make([]txRlp, 0, txsMaxCount),
 
@@ -65,7 +67,19 @@ func NewReadContext(txsMaxCount int, hugeTxMinimalGas, hugeTxGasQuota, totalAvai
 
 		toSkip:   toSkip,
 		toRemove: make([]*metaTx, 0),
+
+		blockNumber: blockNumber,
 	}
+}
+
+func (ctx *readContext) isSameBlockNumber(blockNumber uint64) bool {
+	return ctx.blockNumber == blockNumber
+}
+
+func (ctx *readContext) resetRead(txsMaxCount int, totalAvailableGas, availableBlobGas uint64) {
+	ctx.txsMaxCount = txsMaxCount
+	ctx.totalAvailableGas = totalAvailableGas
+	ctx.availableBlobGas = availableBlobGas
 }
 
 func (ctx *readContext) SetIncludeAllTxs() {
@@ -104,8 +118,8 @@ func (ctx *readContext) IsFullfilled() bool {
 	return availableTxs >= ctx.txsMaxCount || ctx.totalAvailableGas < fixedgas.TxGas
 }
 
-func (ctx *readContext) IsSkip(txId common.Hash) bool {
-	return ctx.toSkip.Contains(txId)
+func (ctx *readContext) IsSkip(txId *[32]byte) bool {
+	return ctx.toSkip.Contains(*txId)
 }
 
 func (ctx *readContext) ConsumeBlobGas(blobCount uint64) bool {
@@ -176,25 +190,34 @@ func (ctx *readContext) processHugeTx(rlpTx []byte, txId common.Hash, sender com
 		if ctx.totalAvailableGas < ctx.hugeTxGasUsage.outQuotaGasUsed {
 			// it's not necessary to add any more huge txs to out quote list.
 			// for the currently out of quote huge txs can supply the lack of normal txs
+			log.Debug(fmt.Sprintf("[%s]Huge tx is out of quote, not necessary to be included in quote", logPrefix),
+				"txId", txId, "gasLimit", gasLimit, "totalAvailableGas", ctx.totalAvailableGas, "outQuotaGasUsed", ctx.hugeTxGasUsage.outQuotaGasUsed)
 			return false
 		}
 		ctx.hugeTxGasUsage.outQuotaGasUsed += gasLimit
 	} else {
 		// quote of huge tx is available, try to add it to in quote list
 		if !ctx.adjustTotalAvailableGas(gasLimit) {
+			log.Debug(fmt.Sprintf("[%s]adjust total available gas for huge tx failed", logPrefix), "txId", txId, "gasLimit", gasLimit, "isOutQuota", isOutQuota, "totalAvailableGas", ctx.totalAvailableGas)
 			return false
 		}
 		ctx.hugeTxGasUsage.inQuotaGasLeft -= gasLimit
 	}
 
+	log.Debug(fmt.Sprintf("[%s]Append huge tx to read context", logPrefix), "txId", txId, "gasLimit", gasLimit, "isOutQuota", isOutQuota, "totalAvailableGas", ctx.totalAvailableGas, "inQuotaGasLeft", ctx.hugeTxGasUsage.inQuotaGasLeft, "outQuotaGasUsed", ctx.hugeTxGasUsage.outQuotaGasUsed)
 	ctx.appendTx(rlpTx, txId, sender, isLocal, gasLimit, isOutQuota)
 	return true
 }
 
 func (ctx *readContext) processNormalTx(rlpTx []byte, txId common.Hash, sender common.Address, isLocal bool, gasLimit, intrinsicGas uint64) bool {
 	if !ctx.adjustTotalAvailableGas(intrinsicGas) {
+		log.Debug(fmt.Sprintf("[%s]adjust total available gas for normal tx failed", logPrefix),
+			"txId", txId, "intrinsicGas", intrinsicGas, "totalAvailableGas", ctx.totalAvailableGas)
 		return false
 	}
+
+	log.Debug(fmt.Sprintf("[%s]Append normal tx to read context", logPrefix),
+		"txId", txId, "intrinsicGas", intrinsicGas, "totalAvailableGas", ctx.totalAvailableGas)
 	ctx.appendTx(rlpTx, txId, sender, isLocal, gasLimit, false)
 	return true
 }
