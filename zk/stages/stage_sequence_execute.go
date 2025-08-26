@@ -395,7 +395,7 @@ BatchLoop:
 		logTicker.Reset(10 * time.Second)
 		// For X Layer block timer
 		blockTimer := time.NewTimer(cfg.zk.XLayer.SequencerMaxBlockSealTime)
-		ethBlockGasPool := new(core.GasPool).AddGas(transactionGasLimit) // used only in normalcy mode per block
+		ethBlockGasPool := new(core.GasPool).AddGas(cfg.zk.XLayer.DynamicBlockGasLimit) // used only in normalcy mode per block
 
 		if batchState.isL1Recovery() {
 			blockNumbersInBatchSoFar, err := batchContext.sdb.hermezDb.GetL2BlockNosByBatch(batchState.batchNumber)
@@ -774,10 +774,12 @@ BatchLoop:
 				batchContext.sdb.eridb.RollbackBatch()
 				return err
 			}
+			commitSmtTime := time.Now()
 			blockCache := batchContext.sdb.eridb.RetriveAndCleanCache()
 			if err := batchContext.sdb.eridb.CommitBatch(); err != nil {
 				return err
 			}
+			metrics.GetLogStatistics().CumulativeTiming(metrics.SmtBatchCommitDBTiming, time.Since(commitSmtTime))
 			setTime := time.Now()
 			s.SetSmtCache(blockNumber, blockCache)
 			metrics.GetLogStatistics().CumulativeTiming(metrics.SetSmtCacheTiming, time.Since(setTime))
@@ -788,9 +790,11 @@ BatchLoop:
 				batchContext.sdb.eridb.RollbackBatch()
 				return err
 			}
+			commitSmtTime := time.Now()
 			if err := batchContext.sdb.eridb.CommitBatch(); err != nil {
 				return err
 			}
+			metrics.GetLogStatistics().CumulativeTiming(metrics.SmtBatchCommitDBTiming, time.Since(commitSmtTime))
 		}
 
 		// For X Layer
