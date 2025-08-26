@@ -397,4 +397,5 @@ var DefaultFlags = []cli.Flag{
 	&utils.DynamicBlockGasLimit,
 	&utils.EnableLatestDataStreamBlockNumberGlobalVariableForRpc,
 	&utils.DataStreamUnwindToBlock,
+	&utils.SyncSeqLogs,
 }
