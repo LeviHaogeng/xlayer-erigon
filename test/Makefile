@@ -241,24 +241,6 @@ test-hugetx-e2e: stop apollo
 # helper to update huge-tx config in YAML (create keys if missing, then set values)
 HUGETX_CFG_FILE := config/apollo.seq.config.yaml
 
-define set_hugetx_cfg
-    @file=$(HUGETX_CFG_FILE); \
-    key1="txpool.huge-tx-threshold-ratio"; \
-    key2="txpool.huge-tx-quota-ratio"; \
-    key3="txpool.ignore-huge-tx-quota-interval"; \
-    key4="zkevm.dynamic-block-gas-limit"; \
-    for k in $$key1 $$key2 $$key3 $$key4; do \
-      if grep -q "^$$k:" $$file; then :; else echo "$$k: 0" >> $$file; fi; \
-    done; \
-    sed -i.bak -e "s/^$$key1:.*/$$key1: $(1)/" $$file; \
-    sed -i.bak -e "s/^$$key2:.*/$$key2: $(2)/" $$file; \
-    sed -i.bak -e "s/^$$key3:.*/$$key3: $(3)/" $$file; \
-    sed -i.bak -e "s/^$$key4:.*/$$key4: $(4)/" $$file; \
-    rm -f $$file.bak; \
-    echo "Updated $$file with threshold=$(1) quota=$(2) ignore=$(3) dynamic-gas=$(4)"; \
-    tail -n 8 $$file
-endef
-
 .PHONY: set_seal_time
 define set_seal_time
 	@file=$(HUGETX_CFG_FILE); \
@@ -281,7 +263,6 @@ define set_seal_time
 	echo "Set $$key=$$val, $$key2=$$max, $$key3=$$batch in $$file"; \
 	tail -n 15 $$file
 endef
-
 
 .PHONY: test-e2e
 test-e2e: stop all ## Runs group xlayer feature e2e tests checking race conditions
