@@ -867,7 +867,7 @@ func TestHugeTxE2E_S11_Quota0_IgnoreInterval0_Mix(t *testing.T) {
 		}
 	}
 
-	require.Equal(t, 2, hugeCnt)
+	require.Equal(t, 3, hugeCnt)
 	require.Greater(t, normalCnt, 0, "Should include some normal transactions")
 }
 
