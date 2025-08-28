@@ -236,6 +236,7 @@ lint:
 test-hugetx-e2e: stop apollo
 	$(call set_seal_time,5s)
 	trap '$(STOP) git checkout -- $(HUGETX_CFG_FILE); rm -rf ./e2e/tmp' EXIT; MallocNanoZone=0 go test -tags hugetx -count=1 -failfast -race -v -p 1 -timeout 600s ./e2e/huge_tx_test.go
+	echo "HugeTx E2E tests passed"
 
 # helper to update huge-tx config in YAML (create keys if missing, then set values)
 HUGETX_CFG_FILE := config/apollo.seq.config.yaml
