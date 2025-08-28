@@ -3,6 +3,8 @@ package txpool
 import (
 	"container/heap"
 	"context"
+	"fmt"
+	"math"
 	"math/big"
 	"slices"
 	"strings"
@@ -13,7 +15,6 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/cmp"
-	"github.com/ledgerwatch/erigon-lib/common/fixedgas"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/types"
 	"github.com/ledgerwatch/erigon/cmd/utils"
@@ -21,6 +22,7 @@ import (
 	"github.com/ledgerwatch/erigon/eth/ethconfig"
 	"github.com/ledgerwatch/erigon/zk/apollo"
 	"github.com/ledgerwatch/erigon/zkevm/hex"
+	"github.com/ledgerwatch/log/v3"
 )
 
 // free gas tx type
@@ -36,7 +38,8 @@ var (
 )
 
 const (
-	erc20TransferMethod = "0xa9059cbb"
+	erc20TransferMethod       = "0xa9059cbb"
+	hugeTxE2EYieldEnabledName = "hugeTxE2EYieldEnabled"
 )
 
 // XLayerConfig contains the X Layer configs for the txpool
@@ -72,6 +75,8 @@ type XLayerConfig struct {
 	OkPaySenderAccountsList common.OrderedList[common.Address]
 	// OkPayBlockPriorityTxsLimit is the max number of OkPay txs that we will prioritize per block
 	OkPayBlockPriorityTxsLimit uint64
+
+	HugeTxConfig atomic.Pointer[ethconfig.HugeTxConfig]
 }
 
 type GPCache interface {
@@ -82,18 +87,8 @@ type GPCache interface {
 	SetLatestRawGP(rgp *big.Int)
 }
 
-type ReadContext struct {
-	txs              *types.TxsRlp
-	availableGas     uint64
-	availableBlobGas uint64
-	toSkip           mapset.Set[[32]byte]
-	toRemove         []*metaTx
-	count            int
-}
-
-func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
+func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
 	removeWG.Wait()
-
 	if p.isDeniedYieldingTransactions() {
 		//log.Trace("Denied yielding transactions, cannot proceed")
 		return false, 0, nil
@@ -105,40 +100,69 @@ func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, a
 		return false, 0, nil
 	}
 
+	hugeTxConfig := p.xlayerCfg.HugeTxConfig.Load()
+	ignoreHugeTxQuota := nextBlockNumber%(hugeTxConfig.IgnoreHugeTxQuotaInterval+1) == 0
+
+	var hugeTxMinimalGas, hugeTxQuotaGas uint64
+	if ignoreHugeTxQuota {
+		hugeTxMinimalGas = math.MaxUint64
+		hugeTxQuotaGas = availableGas
+	} else {
+		hugeTxMinimalGas = hugeTxConfig.HugeTxThresholdRatio * availableGas / 100
+		hugeTxQuotaGas = hugeTxConfig.HugeTxQuotaRatio * availableGas / 100
+	}
+
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 
 	best := p.pending.best
-	readContext := ReadContext{
-		txs:              txs,
-		availableGas:     availableGas,
-		availableBlobGas: availableBlobGas,
-		toSkip:           toSkip,
-		count:            0,
+
+	txsMaxCount := cmp.Min(int(n), len(best.ms))
+
+	var readContext *readContext
+	if p.readContext != nil && p.readContext.isSameBlockNumber(nextBlockNumber) {
+		readContext = p.readContext
+		readContext.resetRead(txsMaxCount, availableGas, availableBlobGas)
+	} else {
+		readContext = NewReadContext(
+			nextBlockNumber,
+			txsMaxCount,
+			hugeTxMinimalGas,
+			hugeTxQuotaGas,
+			availableGas,
+			availableBlobGas,
+			toSkip,
+		)
 	}
-	readContext.txs.Resize(uint(cmp.Min(int(n), len(best.ms))))
 
 	p.pending.EnforceBestInvariants()
 
 	// Prioritize OkPay txs first
-	ok, err := p.bestRead(n, tx, onTopOf, &readContext, true)
+	readContext.SetIncludeAllTxs() // for okpay txs, we don't distinguish huge txs and normal txs
+	ok, err := p.bestRead(n, tx, onTopOf, readContext, true)
 	if err != nil {
-		return ok, readContext.count, err
+		count := readContext.Finalize(txs)
+		return ok, count, err
 	}
 	if !ok {
-		return false, readContext.count, nil
+		count := readContext.Finalize(txs)
+		return false, count, nil
 	}
 
 	// Add all other txs
-	ok, err = p.bestRead(n, tx, onTopOf, &readContext, false)
+	readContext.SetHugeTxQuota(hugeTxMinimalGas, hugeTxQuotaGas)
+	ok, err = p.bestRead(n, tx, onTopOf, readContext, false)
 	if err != nil {
-		return ok, readContext.count, err
+		count := readContext.Finalize(txs)
+		return ok, count, err
 	}
 	if !ok {
-		return false, readContext.count, nil
+		count := readContext.Finalize(txs)
+		return false, count, nil
 	}
 
-	readContext.txs.Resize(uint(readContext.count))
+	count := readContext.Finalize(txs)
+	txs.Resize(uint(count))
 	if len(readContext.toRemove) > 0 {
 		removeWG.Add(1)
 		go func() {
@@ -154,10 +178,10 @@ func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, a
 		time.Sleep(1 * time.Nanosecond)
 	}
 
-	return true, readContext.count, nil
+	return true, count, nil
 }
 
-func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *ReadContext, isOkPayPriority bool) (bool, error) {
+func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *readContext, isOkPayPriority bool) (bool, error) {
 	isShanghai := p.isShanghai()
 	isLondon := p.isLondon()
 	best := p.pending.best
@@ -165,24 +189,22 @@ func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *ReadC
 	okPayTxPriorityCount := uint64(0)
 	maxOkPayTxPriorityCount := p.getOkPayTxPriorityCount()
 
-	for i := 0; readContext.count < int(n) && i < len(best.ms); i++ {
-		// if we wouldn't have enough gas for a standard transaction then quit out early
-		if readContext.availableGas < fixedgas.TxGas {
+	for i := 0; i < len(best.ms); i++ {
+		if readContext.IsFullfilled() {
 			break
 		}
 
 		mt := best.ms[i]
 		//log.Trace("Processing transaction", "txID", mt.Tx.IDHash)
 
-		if readContext.toSkip.Contains(mt.Tx.IDHash) {
+		if readContext.IsSkip(&mt.Tx.IDHash) {
 			//log.Trace("Skipping transaction, already in toSkip", "txID", mt.Tx.IDHash)
 			continue
 		}
 
 		if !isLondon && mt.Tx.Type == 0x2 {
 			// remove ldn txs when not in london
-			readContext.toRemove = append(readContext.toRemove, mt)
-			readContext.toSkip.Add(mt.Tx.IDHash)
+			readContext.AddToSkipAndRemove(mt)
 			//log.Info("Removing London transaction in non-London environment", "txID", mt.Tx.IDHash)
 			continue
 		}
@@ -199,7 +221,7 @@ func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *ReadC
 			return false, err
 		}
 		if len(rlpTx) == 0 {
-			readContext.toRemove = append(readContext.toRemove, mt)
+			readContext.AddToSkipAndRemove(mt)
 			//log.Info("Removing transaction with empty RLP", "txID", common.BytesToHash(mt.Tx.IDHash[:]))
 			continue
 		}
@@ -217,34 +239,18 @@ func (p *TxPool) bestRead(n uint16, tx kv.Tx, onTopOf uint64, readContext *ReadC
 		}
 
 		// Skip transactions that require more blob gas than is available
-		blobCount := uint64(len(mt.Tx.BlobHashes))
-		if blobCount*fixedgas.BlobGasPerBlob > readContext.availableBlobGas {
+		if !readContext.ConsumeBlobGas(uint64(len(mt.Tx.BlobHashes))) {
 			//log.Trace("Skipping transaction due to insufficient blob gas", "txID", mt.Tx.IDHash, "requiredBlobGas", blobCount*fixedgas.BlobGasPerBlob, "availableBlobGas", availableBlobGas)
 			continue
 		}
-		readContext.availableBlobGas -= blobCount * fixedgas.BlobGasPerBlob
 
 		// make sure we have enough gas in the caller to add this transaction.
 		// not an exact science using intrinsic gas but as close as we could hope for at
 		// this stage
 		intrinsicGas, _ := CalcIntrinsicGas(uint64(mt.Tx.DataLen), uint64(mt.Tx.DataNonZeroLen), nil, mt.Tx.Creation, true, true, isShanghai)
-		if intrinsicGas > readContext.availableGas {
-			// we might find another TX with a low enough intrinsic gas to include so carry on
-			//log.Trace("Skipping transaction due to insufficient gas", "txID", mt.Tx.IDHash, "intrinsicGas", intrinsicGas, "availableGas", availableGas)
+		if !readContext.AddTx(rlpTx, mt.Tx.IDHash, sender, isLocal, mt.Tx.Gas, intrinsicGas) {
 			continue
 		}
-
-		if intrinsicGas <= readContext.availableGas { // check for potential underflow
-			readContext.availableGas -= intrinsicGas
-		}
-
-		//log.Trace("Including transaction", "txID", mt.Tx.IDHash)
-		readContext.txs.Txs[readContext.count] = rlpTx
-		readContext.txs.TxIds[readContext.count] = mt.Tx.IDHash
-		copy(readContext.txs.Senders.At(readContext.count), sender.Bytes())
-		readContext.txs.IsLocal[readContext.count] = isLocal
-		readContext.toSkip.Add(mt.Tx.IDHash)
-		readContext.count++
 
 		// For OkPay
 		if isOkPayPriority && isOkPayTx {
@@ -420,6 +426,18 @@ func (p *TxPool) listenApollo(ctx context.Context) {
 				p.setFreeGasList(ethCfg.DeprecatedTxPool.FreeGasList)
 				p.lock.Unlock()
 			}
+			if isContainsHugeTxConfig(ethCfg.XLayer.ApolloChanged) {
+				p.setHugeTxConfig(ethCfg.DeprecatedTxPool.HugeTxConfig)
+			}
+			// for huge tx e2e test
+			if slices.Contains(ethCfg.XLayer.ApolloChanged, hugeTxE2EYieldEnabledName) {
+				log.Info("listenApollo: HugeTxE2EYieldEnabled is set through Apollo config center", "value", ethCfg.DeprecatedTxPool.HugeTxConfig.HugeTxE2EYieldEnabled)
+				if ethCfg.DeprecatedTxPool.HugeTxConfig.HugeTxE2EYieldEnabled {
+					p.allowYieldingTransactions()
+				} else {
+					p.denyYieldingTransactions()
+				}
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -438,6 +456,19 @@ func (p *TxPool) getOkPayTxPriorityCount() uint64 {
 		return p.apolloCfg.GetOkPayBlockPriorityTxsLimit(p.xlayerCfg.OkPayBlockPriorityTxsLimit)
 	}
 	return p.xlayerCfg.OkPayBlockPriorityTxsLimit
+}
+
+func (p *TxPool) setHugeTxConfig(hugeTxConfig ethconfig.HugeTxConfig) {
+	if hugeTxConfig.HugeTxThresholdRatio > 100 {
+		panic(fmt.Sprintf("huge tx threshold ratio must be less than 100, but got %d", hugeTxConfig.HugeTxThresholdRatio))
+	}
+	if hugeTxConfig.HugeTxQuotaRatio > 100 {
+		panic(fmt.Sprintf("huge tx quota ratio must be less than 100, but got %d", hugeTxConfig.HugeTxQuotaRatio))
+	}
+
+	cfg := new(ethconfig.HugeTxConfig)
+	*cfg = hugeTxConfig
+	p.xlayerCfg.HugeTxConfig.Store(cfg)
 }
 
 var requireTxPoolLock atomic.Bool
@@ -461,4 +492,15 @@ func (p *PendingPool) RemoveNoLock(i *metaTx) {
 		p.sorted.Swap(false)
 	}
 	i.currentSubPool = 0
+}
+
+func isContainsHugeTxConfig(changed []string) bool {
+	for _, c := range changed {
+		if c == utils.TxPoolHugeTxThresholdRatio.Name ||
+			c == utils.TxPoolHugeTxQuotaRatio.Name ||
+			c == utils.TxPoolIgnoreHugeTxQuotaInterval.Name {
+			return true
+		}
+	}
+	return false
 }

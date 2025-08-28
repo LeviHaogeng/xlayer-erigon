@@ -32,6 +32,11 @@ func (c *Client) getConfigContext(value interface{}) (*cli.Context, map[string]i
 	// sets global flags to value in apollo config
 	ctx := createMockContext(c.flags)
 	for key, value := range config {
+		// Skip hugeTxE2EYieldEnabled as it's not a CLI flag but a special config handled separately
+		if key == "hugeTxE2EYieldEnabled" {
+			continue
+		}
+
 		if !ctx.IsSet(key) {
 			if reflect.ValueOf(value).Kind() == reflect.Slice {
 				sliceInterface := value.([]interface{})

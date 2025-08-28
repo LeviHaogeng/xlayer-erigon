@@ -24,9 +24,9 @@ zkevm.datastream-version: 2
 
 log.console.verbosity: info
 
-zkevm.sequencer-block-seal-time: "400ms"
-zkevm.sequencer-max-block-seal-time: "400ms"
-zkevm.sequencer-batch-seal-time: "60s"
+zkevm.sequencer-block-seal-time: "1s"
+zkevm.sequencer-max-block-seal-time: "3s"
+zkevm.sequencer-batch-seal-time: "10s"
 zkevm.sequencer-batch-sleep-duration: "0s"
 
 zkevm.data-stream-host: "localhost"
@@ -102,15 +102,14 @@ zkevm.seal-batch-immediately-on-overflow: true
 zkevm.sequencer-timeout-on-empty-tx-pool: 5ms
 zkevm.pre-run-address-list: [""]
 zkevm.block-info-concurrent: true
-# zkevm.standalone-smt-db: true  # true: enable split smt db, false: not split
-# zkevm.enable-async-commit: true
+zkevm.standalone-smt-db: true  # true: enable split smt db, false: not split
+zkevm.enable-async-commit: true
 
 # to reduce lock race in stress test
 txpool.enabletimsort: true
 zkevm.bulk-add-txs: true
 zkevm.enable-add-tx-notify: true
 zkevm.initial-batch.config: /usr/src/app/first-batch-config.json
-
 
 zkevm.verification-batch-delay: 2
 zkevm.skip-analysis-group-api: true
@@ -119,14 +118,17 @@ zkevm.skip-analysis-group-api: true
 # zkevm.analysis-group-service-name: "analysis-group"
 # zkevm.analysis-group-api-path: "api/v1/196/validHeight"
 
-# realtime.enable-flag: true
-# realtime.enable-subscribe-flag: false
+realtime.enable-flag: true
+realtime.enable-subscribe-flag: false
 realtime.cache-height-threshold: 10
 realtime.kafka-sync-bootstrap-servers: "xlayer-kafka:9092"
 realtime.kafka-sync-tx-topic: xlayer-tx
 realtime.kafka-sync-block-topic: xlayer-header
 realtime.kafka-sync-error-topic: xlayer-error
 realtime.kafka-sync-client-id: "xlayer-producer"
+
+bridgeIntercept.bridge-contract-address: "0x4B24266C13AFEf2bb60e2C69A4C08A482d81e3CA"
+bridgeIntercept.target-token-address: "0x5FbDB2315678afecb367f032d93F642f64180aa3"
 bridgeIntercept.max-bridge-amount: "1000000000000000000000"
-bridgeIntercept.whitelist-enabled: true
+bridgeIntercept.whitelist-enabled: false
 bridgeIntercept.whitelist-addresses: "0x8f8E2d6cF621f30e9a11309D6A56A876281Fd534,0xDE282DC882bbB5100b8A24E30D38a2D5B3080c15"
