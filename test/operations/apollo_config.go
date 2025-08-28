@@ -16,7 +16,6 @@ import (
 
 const (
 	// Apollo configuration constants
-	apolloConfigURL     = "127.0.0.1:8085"       // Apollo config service url
 	apolloSeqAppID      = "XLayerSeq"            // Default Apollo app ID
 	apolloPoolNamespace = "pool-config.txt"      // Pool namespace for txpool config
 	apolloSeqNamespace  = "sequencer-config.txt" // Sequencer namespace for sequencer config
@@ -35,6 +34,40 @@ const (
 	dynamicBlockGasLimitKey = "zkevm.dynamic-block-gas-limit" // Dynamic block gas limit for zkevm
 )
 
+// getApolloConfigURL returns the Apollo config service URL based on environment
+func getApolloConfigURL() string {
+	// Try environment variable first
+	if url := os.Getenv("APOLLO_CONFIG_URL"); url != "" {
+		return url
+	}
+
+	// Check if running in CI environment
+	if os.Getenv("CI") == "true" || os.Getenv("GITHUB_ACTIONS") == "true" {
+		// In CI, try to use container name
+		return "apollo-configservice:8085"
+	}
+
+	// Default for local development
+	return "127.0.0.1:8085"
+}
+
+// getApolloPortalURL returns the Apollo portal URL based on environment
+func getApolloPortalURL() string {
+	// Try environment variable first
+	if url := os.Getenv("APOLLO_PORTAL_URL"); url != "" {
+		return url
+	}
+
+	// Check if running in CI environment
+	if os.Getenv("CI") == "true" || os.Getenv("GITHUB_ACTIONS") == "true" {
+		// In CI, try to use container name
+		return "http://apollo-portal:8070"
+	}
+
+	// Default for local development
+	return "http://127.0.0.1:8070"
+}
+
 // ApolloConfigController manages Apollo configuration changes for testing
 type ApolloConfigController struct {
 	client     *agollo.Client
@@ -46,7 +79,7 @@ type ApolloConfigController struct {
 func NewApolloConfigController(t *testing.T) *ApolloConfigController {
 	// Create Apollo client configuration (for reading config changes)
 	c := &config.AppConfig{
-		IP:             apolloConfigURL, // Config service port
+		IP:             getApolloConfigURL(), // Config service port
 		AppID:          apolloSeqAppID,
 		NamespaceName:  apolloPoolNamespace,
 		Cluster:        "default",
@@ -90,7 +123,8 @@ func (c *ApolloConfigController) initPortalSession() error {
 
 	// Login to Apollo Portal
 	loginData := fmt.Sprintf("username=%s&password=%s", apolloUsername, apolloPassword)
-	req, err := http.NewRequest("POST", "http://127.0.0.1:8070/signin", bytes.NewBuffer([]byte(loginData)))
+	portalURL := getApolloPortalURL()
+	req, err := http.NewRequest("POST", portalURL+"/signin", bytes.NewBuffer([]byte(loginData)))
 	if err != nil {
 		return fmt.Errorf("failed to create login request: %v", err)
 	}
@@ -135,7 +169,8 @@ func (c *ApolloConfigController) getNamespaceData(namespace string) (*NamespaceD
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	url := fmt.Sprintf("http://127.0.0.1:8070/apps/XLayerSeq/envs/DEV/clusters/default/namespaces/%s", namespace)
+	portalURL := getApolloPortalURL()
+	url := fmt.Sprintf("%s/apps/XLayerSeq/envs/DEV/clusters/default/namespaces/%s", portalURL, namespace)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -243,7 +278,8 @@ func (c *ApolloConfigController) updateNamespaceConfig(namespace, newContent str
 	}
 
 	// Update config item using correct endpoint
-	url := fmt.Sprintf("http://127.0.0.1:8070/apps/XLayerSeq/envs/DEV/clusters/default/namespaces/%s/item", namespace)
+	portalURL := getApolloPortalURL()
+	url := fmt.Sprintf("%s/apps/XLayerSeq/envs/DEV/clusters/default/namespaces/%s/item", portalURL, namespace)
 	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %v", err)
@@ -288,7 +324,8 @@ func (c *ApolloConfigController) publishNamespaceConfig(namespace string) error 
 		return fmt.Errorf("failed to marshal release payload: %v", err)
 	}
 
-	url := fmt.Sprintf("http://127.0.0.1:8070/apps/XLayerSeq/envs/DEV/clusters/default/namespaces/%s/releases", namespace)
+	portalURL := getApolloPortalURL()
+	url := fmt.Sprintf("%s/apps/XLayerSeq/envs/DEV/clusters/default/namespaces/%s/releases", portalURL, namespace)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create release request: %v", err)
