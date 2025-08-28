@@ -27,6 +27,9 @@ type HugeTxConfig struct {
 	HugeTxThresholdRatio      uint64
 	HugeTxQuotaRatio          uint64
 	IgnoreHugeTxQuotaInterval uint64
+
+	// for huge tx e2e test
+	HugeTxE2EYieldEnabled bool
 }
 
 // DeprecatedTxPoolConfig are the configuration parameters of the transaction pool.

@@ -38,7 +38,8 @@ var (
 )
 
 const (
-	erc20TransferMethod = "0xa9059cbb"
+	erc20TransferMethod       = "0xa9059cbb"
+	hugeTxE2EYieldEnabledName = "hugeTxE2EYieldEnabled"
 )
 
 // XLayerConfig contains the X Layer configs for the txpool
@@ -88,8 +89,6 @@ type GPCache interface {
 
 func (p *TxPool) bestForXLayer(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
 	removeWG.Wait()
-	log.Debug(fmt.Sprintf("[%s]bestForXLayer", logPrefix), "n", n, "onTopOf", onTopOf, "nextBlockNumber", nextBlockNumber, "availableGas", availableGas, "availableBlobGas", availableBlobGas)
-
 	if p.isDeniedYieldingTransactions() {
 		//log.Trace("Denied yielding transactions, cannot proceed")
 		return false, 0, nil
@@ -429,6 +428,15 @@ func (p *TxPool) listenApollo(ctx context.Context) {
 			}
 			if isContainsHugeTxConfig(ethCfg.XLayer.ApolloChanged) {
 				p.setHugeTxConfig(ethCfg.DeprecatedTxPool.HugeTxConfig)
+			}
+			// for huge tx e2e test
+			if slices.Contains(ethCfg.XLayer.ApolloChanged, hugeTxE2EYieldEnabledName) {
+				log.Info("listenApollo: HugeTxE2EYieldEnabled is set through Apollo config center", "value", ethCfg.DeprecatedTxPool.HugeTxConfig.HugeTxE2EYieldEnabled)
+				if ethCfg.DeprecatedTxPool.HugeTxConfig.HugeTxE2EYieldEnabled {
+					p.allowYieldingTransactions()
+				} else {
+					p.denyYieldingTransactions()
+				}
 			}
 		case <-ctx.Done():
 			return

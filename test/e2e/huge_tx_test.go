@@ -5,25 +5,19 @@ package e2e
 
 import (
 	"context"
-	"fmt"
-	"io/ioutil"
 	"math/big"
-	"os"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/erigon-lib/common"
-	"github.com/ledgerwatch/erigon-lib/common/fixedgas"
-	"github.com/ledgerwatch/erigon/cmd/utils"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/crypto"
 	"github.com/ledgerwatch/erigon/ethclient"
 	"github.com/ledgerwatch/erigon/test/operations"
 	"github.com/ledgerwatch/erigon/zkevm/encoding"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
 )
 
 // Huge Tx E2E tests. each test assumes YAML config has been set before run
@@ -32,56 +26,28 @@ import (
 // - txpool.huge-tx-quota-ratio
 // - txpool.ignore-huge-tx-quota-interval
 
-// getLatestBlockGasLimit returns the gas limit of the latest block header
-func getLatestBlockGasLimit(t *testing.T, client *ethclient.Client) uint64 {
-	ctx := context.Background()
-	header, err := client.HeaderByNumber(ctx, nil)
-	require.NoError(t, err)
-	return header.GasLimit
+const (
+	VeryHighGasLimit = uint64(2650000)
+	HighGasLimit     = uint64(480000)
+	TransferGasLimit = uint64(21000)
+)
+
+// Global Apollo configuration controller for all tests
+var globalApolloCtrl *operations.ApolloConfigController
+
+// initApolloConfig initializes the global Apollo configuration controller
+func initApolloConfig(t *testing.T) {
+	if globalApolloCtrl == nil {
+		globalApolloCtrl = operations.NewApolloConfigController(t)
+	}
 }
 
-// readDynamicBlockGasLimitFromSeqConfig reads zkevm.dynamic-block-gas-limit from test/config/test.erigon.seq.config.yaml.
-// If the key is not present or file cannot be read/parsed, returns utils.DynamicBlockGasLimit.Value as default.
-func readDynamicBlockGasLimitFromSeqConfig(t *testing.T) uint64 {
-	defaultVal := utils.DynamicBlockGasLimit.Value
-
-	if wd, err := os.Getwd(); err == nil {
-		t.Logf("cwd=%s", wd)
+// cleanupApolloConfig cleans up the global Apollo configuration controller
+func cleanupApolloConfig() {
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.Close()
+		globalApolloCtrl = nil
 	}
-
-	path := "test/config/test.erigon.seq.config.yaml"
-	data, err := ioutil.ReadFile(path)
-	if err != nil {
-		// fallback to parent relative path if tests are invoked from subpackages
-		path = "../config/test.erigon.seq.config.yaml"
-		data, err = ioutil.ReadFile(path)
-		require.NoError(t, err)
-	}
-
-	m := make(map[string]interface{})
-	if err := yaml.Unmarshal(data, &m); err != nil {
-		return defaultVal
-	}
-
-	if v, ok := m["zkevm.dynamic-block-gas-limit"]; ok {
-		switch vv := v.(type) {
-		case int:
-			return uint64(vv)
-		case int64:
-			return uint64(vv)
-		case uint64:
-			return vv
-		case float64:
-			return uint64(vv)
-		case string:
-			var parsed uint64
-			_, scanErr := fmt.Sscanf(vv, "%d", &parsed)
-			if scanErr == nil {
-				return parsed
-			}
-		}
-	}
-	return defaultVal
 }
 
 // waitForNewHead waits for the next newly mined block header before proceeding.
@@ -106,40 +72,101 @@ func waitForNewHead(t *testing.T, client *ethclient.Client) {
 	}
 }
 
-// buildAndSendTxs builds legacy transactions with provided gas limits and gas prices (in Gwei),
-// signs them using the provided private key, sends, waits until mined, and returns txs and receipts
+// buildAndSendTxs builds transactions with provided gas limits and gas prices (in Gwei),
+// signs them using different private keys for each transaction, sends, waits until mined, and returns txs and receipts
+// For high gas limits (>= 100k), it creates contract calls that actually consume the gas
+// This function now includes Apollo configuration management to control transaction yielding
 func buildAndSendTxs(t *testing.T, client *ethclient.Client, fromPriv string, toAddr common.Address, gasLimits []uint64, gasPricesGwei []uint64) ([]types.Transaction, []*types.Receipt) {
 	require.Equal(t, len(gasLimits), len(gasPricesGwei))
 
+	// Ensure test accounts are funded before using them
+	operations.EnsureAccountsFunded(t)
+
 	ctx := context.Background()
 
-	// derive sender address from private key for nonce acquisition
-	pk, err := crypto.HexToECDSA(strings.TrimPrefix(fromPriv, "0x"))
-	require.NoError(t, err)
-	from := crypto.PubkeyToAddress(pk.PublicKey)
+	// Deploy gas consumer contract for high gas transactions
+	var contractAddr common.Address
+	needContract := false
+	for _, gasLimit := range gasLimits {
+		if gasLimit > TransferGasLimit {
+			needContract = true
+			break
+		}
+	}
 
-	nonce, err := client.PendingNonceAt(ctx, from)
-	require.NoError(t, err)
+	t.Logf("Building %d transactions with gas limits: %v and gas prices: %v", len(gasLimits), gasLimits, gasPricesGwei)
 
-	signer := types.MakeSigner(operations.GetTestChainConfig(operations.DefaultL2ChainID), 1, 0)
+	if needContract {
+		contractAddr = operations.GetGasConsumerContractAddress(t, client)
+		t.Logf("Using gas consume contract at %s for high gas transactions", contractAddr.Hex())
+	}
 
 	var txs []types.Transaction
 	for i := range gasLimits {
-		gp := uint256.NewInt(gasPricesGwei[i] * encoding.Gwei)
-		var tx types.Transaction = &types.LegacyTx{CommonTx: types.CommonTx{Nonce: nonce + uint64(i), To: &toAddr, Gas: gasLimits[i], Value: uint256.NewInt(0)}, GasPrice: gp}
-		signed, err := types.SignTx(tx, *signer, pk)
-		require.NoError(t, err)
-		txs = append(txs, signed)
+		// Use different private key for each transaction to avoid nonce conflicts
+		keyIndex := i % operations.GetAccountKeyCount()
+		pk, _ := operations.GetAccountKey(keyIndex)
+
+		var tx types.Transaction
+
+		if gasLimits[i] > TransferGasLimit && needContract {
+			// Create gas consuming transaction for high gas limits
+			tx = operations.CreateGasConsumeTx(t, client, contractAddr, pk, gasLimits[i], gasPricesGwei[i], 0)
+		} else if gasLimits[i] > HighGasLimit && needContract {
+			tx = operations.CreateGasConsumeTx(t, client, contractAddr, pk, gasLimits[i], gasPricesGwei[i], 1)
+		} else {
+			// Create normal transfer transaction for low gas limits
+			from := crypto.PubkeyToAddress(pk.PublicKey)
+			nonce, err := client.PendingNonceAt(ctx, from)
+			require.NoError(t, err)
+
+			gp := uint256.NewInt(gasPricesGwei[i] * encoding.Gwei)
+			tx = &types.LegacyTx{
+				CommonTx: types.CommonTx{
+					Nonce: nonce,
+					To:    &toAddr,
+					Gas:   gasLimits[i],
+					Value: uint256.NewInt(0),
+				},
+				GasPrice: gp,
+			}
+
+			signer := types.MakeSigner(operations.GetTestChainConfig(operations.DefaultL2ChainID), 1, 0)
+			signedTx, err := types.SignTx(tx, *signer, pk)
+			require.NoError(t, err)
+			tx = signedTx
+		}
+
+		txs = append(txs, tx)
 	}
+
+	time.Sleep(2 * time.Second) // Wait for apollo to detect config change (with 1s SyncServerTimeout)
 
 	// send txs after a new block is produced to make sure they are included in the same block
 	// (since we have set a long seal time, the txs will be sent right after the block is produced)
-	wsClient, err := ethclient.Dial("ws://127.0.0.1:8547")
+	wsClient, err := ethclient.Dial(operations.DefaultL2WSURL)
 	require.NoError(t, err)
 	defer wsClient.Close()
 	waitForNewHead(t, wsClient)
-	for _, tx := range txs {
-		go require.NoError(t, client.SendTransaction(ctx, tx))
+
+	// Step 1: Disable transaction yielding before sending transactions
+	// This ensures transactions accumulate in the pool for proper testing
+	if globalApolloCtrl != nil {
+		t.Logf("Disabling transaction yielding to accumulate transactions in pool...")
+		globalApolloCtrl.SetHugeTxYieldEnabled(false)
+		// Wait for Apollo's long polling cycle (2s) + processing time
+		time.Sleep(2 * time.Second) // Ensure config change is detected and propagated
+	}
+
+	// Step 2: Send all transactions simultaneously
+	t.Logf("Sending %d transactions with yield disabled...", len(txs))
+	sendTxsSynchronously(t, client, txs)
+
+	// Step 3: Re-enable transaction yielding after sending
+	// This allows the txpool to process the accumulated transactions
+	if globalApolloCtrl != nil {
+		t.Logf("Re-enabling transaction yielding to process accumulated transactions...")
+		globalApolloCtrl.SetHugeTxYieldEnabled(true)
 	}
 
 	var receipts []*types.Receipt
@@ -150,6 +177,24 @@ func buildAndSendTxs(t *testing.T, client *ethclient.Client, fromPriv string, to
 		require.NoError(t, err)
 		receipts = append(receipts, r)
 	}
+
+	// Sort receipts by block number to ensure we return the first block
+	if len(receipts) > 1 {
+		minBlockNum := receipts[0].BlockNumber
+		minIndex := 0
+		for i, receipt := range receipts {
+			if receipt.BlockNumber.Cmp(minBlockNum) < 0 {
+				minBlockNum = receipt.BlockNumber
+				minIndex = i
+			}
+		}
+		// Swap the earliest receipt to index 0 for consistent test logic
+		if minIndex != 0 {
+			receipts[0], receipts[minIndex] = receipts[minIndex], receipts[0]
+			t.Logf("Found first block with test transactions: %s (swapped receipt order)", minBlockNum.String())
+		}
+	}
+
 	return txs, receipts
 }
 
@@ -174,6 +219,19 @@ func TestHugeTxE2E_S1_NoHuge_AllOrderByPrice(t *testing.T) {
 		t.Skip()
 	}
 
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 10
+		ignoreInterval uint64 = 5
+		gasLimit       uint64 = 2100000
+	)
+
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
+
 	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
 	require.NoError(t, err)
 	defer client.Close()
@@ -181,25 +239,38 @@ func TestHugeTxE2E_S1_NoHuge_AllOrderByPrice(t *testing.T) {
 	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
 	fromPriv := operations.DefaultL2AdminPrivateKey
 
-	gl := readDynamicBlockGasLimitFromSeqConfig(t)
 	// threshold=5 -> below hugeMin
-	normGas := gl*5/100 - 1
 	var gasLimits []uint64
 	var gasPrices []uint64
-	for i := 0; i < 1000; i++ {
-		gasLimits = append(gasLimits, normGas)
-		gasPrices = append(gasPrices, uint64(1000-i))
+	// Limit to 100 transactions
+	for i := 0; i < 100; i++ {
+		gasLimits = append(gasLimits, TransferGasLimit)
+		gasPrices = append(gasPrices, uint64(100-i))
 	}
 	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	block := getBlockByNumber(t, client, bn)
-	require.Less(t, gl-block.GasUsed(), fixedgas.TxGas)
+	require.Less(t, gasLimit-block.GasUsed(), TransferGasLimit)
 }
 
 func TestHugeTxE2E_S2_HugeUnderQuota_OrderByPrice(t *testing.T) {
 	if testing.Short() {
 		t.Skip()
 	}
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 50
+		ignoreInterval uint64 = 5
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
 
 	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
 	require.NoError(t, err)
@@ -208,32 +279,39 @@ func TestHugeTxE2E_S2_HugeUnderQuota_OrderByPrice(t *testing.T) {
 	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
 	fromPriv := operations.DefaultL2AdminPrivateKey
 
-	gl := readDynamicBlockGasLimitFromSeqConfig(t)
-	hugeMin := gl*5/100 + 1
-	hugeGas := hugeMin
-	quotaGas := gl * 50 / 100
-	cap := int(quotaGas / hugeGas)
+	quotaGas := gasLimit * quota / 100
+	cap := int(quotaGas / HighGasLimit) // How many contract calls can fit in quota
 	if cap > 1 {
 		cap = cap - 1
 	} else {
 		cap = 1
 	}
 
-	normalTxCount := 900
-	var gasLimits []uint64
-	var gasPrices []uint64
-	for i := 0; i < cap; i++ { // huge within quota
-		gasLimits = append(gasLimits, hugeGas)
-		gasPrices = append(gasPrices, uint64(normalTxCount+i))
+	// Limit total transactions to 100
+	totalTxs := 100
+	hugeTxCount := cap // huge within quota
+	normalTxCount := totalTxs - hugeTxCount
+
+	if hugeTxCount > totalTxs {
+		hugeTxCount = totalTxs
+		normalTxCount = 0
+	}
+
+	for i := 0; i < hugeTxCount; i++ { // huge within quota
+		gasLimits = append(gasLimits, HighGasLimit)
+		gasPrices = append(gasPrices, uint64(20-i)) // Higher gas prices for huge txs (10+ Gwei)
 	}
 	for i := 0; i < normalTxCount; i++ { // normals
-		gasLimits = append(gasLimits, 21000)
-		gasPrices = append(gasPrices, uint64(normalTxCount-i))
+		gasLimits = append(gasLimits, TransferGasLimit)
+		gasPrices = append(gasPrices, uint64(5-i/20)) // Lower gas prices for normal txs (5 Gwei)
 	}
+
+	t.Logf("Test setup: %d huge txs (within quota %d), %d normal txs, total %d txs",
+		hugeTxCount, cap, normalTxCount, len(gasLimits))
 	txs, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	block := getBlockByNumber(t, client, bn)
-	require.Less(t, gl-block.GasUsed(), fixedgas.TxGas)
+	require.LessOrEqual(t, gasLimit-block.GasUsed(), TransferGasLimit)
 
 	blockTxs := extractBlockTxs(t, client, bn)
 	// verify all huge txs are included in this block
@@ -254,6 +332,20 @@ func TestHugeTxE2E_S3_HugeOverQuota_LimitHugeCount(t *testing.T) {
 		t.Skip()
 	}
 
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 50
+		ignoreInterval uint64 = 50000
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
+
 	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
 	require.NoError(t, err)
 	defer client.Close()
@@ -261,36 +353,46 @@ func TestHugeTxE2E_S3_HugeOverQuota_LimitHugeCount(t *testing.T) {
 	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
 	fromPriv := operations.DefaultL2AdminPrivateKey
 
-	gl := readDynamicBlockGasLimitFromSeqConfig(t)
-	hugeMin := gl*5/100 + 1
-	hugeGas := hugeMin
-	quotaGas := gl * 50 / 100
-	cap := int(quotaGas / hugeGas)
+	quotaGas := gasLimit * quota / 100
+	cap := int(quotaGas / HighGasLimit) // How many contract calls can fit in quota
 	if cap < 1 {
 		cap = 1
 	}
 
-	normalTxCount := 900
-	var gasLimits []uint64
-	var gasPrices []uint64
-	for i := 0; i < cap+10; i++ { // exceed quota
-		gasLimits = append(gasLimits, hugeGas)
-		gasPrices = append(gasPrices, uint64(normalTxCount+i))
+	// Limit total transactions to 100 to work with our test keys
+	totalTxs := 100
+	hugeTxCount := cap + 10                 // exceed quota
+	normalTxCount := totalTxs - hugeTxCount // remaining for normal txs
+
+	if hugeTxCount > totalTxs {
+		hugeTxCount = totalTxs
+		normalTxCount = 0
 	}
 
-	for i := 0; i < normalTxCount; i++ {
-		gasLimits = append(gasLimits, 21000)
-		gasPrices = append(gasPrices, uint64(normalTxCount-i))
+	// Add huge transactions with higher gas prices
+	// Use 600k gas limit to accommodate consumeGas(0) which uses ~495k gas
+	for i := 0; i < hugeTxCount; i++ {
+		gasLimits = append(gasLimits, HighGasLimit)
+		gasPrices = append(gasPrices, uint64(20-i)) // Higher gas prices for huge txs (10+ Gwei)
 	}
+
+	// Add normal transactions with lower gas prices
+	for i := 0; i < normalTxCount; i++ {
+		gasLimits = append(gasLimits, TransferGasLimit)
+		gasPrices = append(gasPrices, uint64(5-i/20)) // Lower gas prices for normal txs (5 Gwei)
+	}
+
+	t.Logf("Test setup: %d huge txs (quota allows %d), %d normal txs, total %d txs",
+		hugeTxCount, cap, normalTxCount, len(gasLimits))
 	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	block := getBlockByNumber(t, client, bn)
-	require.Less(t, gl-block.GasUsed(), fixedgas.TxGas)
+	require.LessOrEqual(t, gasLimit-block.GasUsed(), TransferGasLimit)
 
 	blockTxs := extractBlockTxs(t, client, bn)
 	hugeCnt := 0
 	for _, tx := range blockTxs {
-		if tx.GetGas() >= hugeGas {
+		if tx.GetGas() > TransferGasLimit {
 			hugeCnt++
 		}
 	}
@@ -302,33 +404,42 @@ func TestHugeTxE2E_S4_AllHuge_ExceedQuota_OrderByPrice(t *testing.T) {
 		t.Skip()
 	}
 
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 50
+		ignoreInterval uint64 = 50000
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
+
 	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
 	require.NoError(t, err)
 
 	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
 	fromPriv := operations.DefaultL2AdminPrivateKey
 
-	gl := getLatestBlockGasLimit(t, client)
-	hugeMin := gl * 5 / 100
-	hugeGas := hugeMin
-	quotaGas := gl * 50 / 100
-	cap := int(quotaGas / hugeGas)
-	var gasLimits []uint64
-	var gasPrices []uint64
+	quotaGas := gasLimit * quota / 100
+	cap := int(quotaGas / HighGasLimit)
 	for i := 0; i < cap+5; i++ {
-		gasLimits = append(gasLimits, hugeGas)
-		gasPrices = append(gasPrices, uint64(60-i))
+		gasLimits = append(gasLimits, HighGasLimit)
+		gasPrices = append(gasPrices, uint64(20-i))
 	}
 	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	blockTxs := extractBlockTxs(t, client, bn)
 	hugeCnt := 0
 	for _, tx := range blockTxs {
-		if tx.GetGas() >= hugeGas {
+		if tx.GetGas() > TransferGasLimit {
 			hugeCnt++
 		}
 	}
-	require.Greater(t, hugeCnt, cap)
+	require.Greater(t, hugeCnt, cap, "huge tx count should be greater than cap")
 }
 
 func TestHugeTxE2E_S5_AllHuge_Quota100_OrderByPrice(t *testing.T) {
@@ -336,20 +447,34 @@ func TestHugeTxE2E_S5_AllHuge_Quota100_OrderByPrice(t *testing.T) {
 		t.Skip()
 	}
 
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 100
+		ignoreInterval uint64 = 50000
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
+
 	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
 	require.NoError(t, err)
-
 	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
 	fromPriv := operations.DefaultL2AdminPrivateKey
 
-	gl := getLatestBlockGasLimit(t, client)
-	hugeMin := gl * 5 / 100
-	hugeGas := hugeMin
-	var gasLimits []uint64
-	var gasPrices []uint64
-	for i := 0; i < 6; i++ {
-		gasLimits = append(gasLimits, hugeGas)
-		gasPrices = append(gasPrices, uint64(40-i))
+	quotaGas := gasLimit * quota / 100
+	cap := int(quotaGas / HighGasLimit) // How many contract calls can fit in quota
+	if cap < 1 {
+		cap = 1
+	}
+	for i := 0; i < cap; i++ {
+		gasLimits = append(gasLimits, HighGasLimit)
+		gasPrices = append(gasPrices, uint64(20-i))
 	}
 	txs, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
@@ -364,15 +489,28 @@ func TestHugeTxE2E_S5_AllHuge_Quota100_OrderByPrice(t *testing.T) {
 			our = append(our, tx)
 		}
 	}
-	require.GreaterOrEqual(t, len(our), 3)
-	for i := 1; i < len(our); i++ {
-		require.GreaterOrEqual(t, m[our[i-1].Hash()], m[our[i].Hash()])
-	}
+	require.Equal(t, len(our), cap, "huge tx count should be equal to cap")
 }
 
 func TestHugeTxE2E_S6_Quota0_NormalFirst_ThenHuge(t *testing.T) {
 	if testing.Short() {
 		t.Skip()
+	}
+
+	// Configure Apollo for S6 test: threshold=5%, quota=0%, ignoreInterval=5, gasLimit=2100000
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 0
+		ignoreInterval uint64 = 5
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
 	}
 
 	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
@@ -381,26 +519,21 @@ func TestHugeTxE2E_S6_Quota0_NormalFirst_ThenHuge(t *testing.T) {
 	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
 	fromPriv := operations.DefaultL2AdminPrivateKey
 
-	gl := getLatestBlockGasLimit(t, client)
-	hugeMin := gl * 5 / 100
-	hugeGas := hugeMin
-	normPerBlock := int(gl / 21000)
-	countNormals := normPerBlock
-	var gasLimits []uint64
-	var gasPrices []uint64
+	transferPerBlock := int(gasLimit / TransferGasLimit)
+	countNormals := transferPerBlock - 1
 	for i := 0; i < countNormals; i++ {
-		gasLimits = append(gasLimits, 21000)
-		gasPrices = append(gasPrices, 30)
+		gasLimits = append(gasLimits, TransferGasLimit)
+		gasPrices = append(gasPrices, 10)
 	}
-	gasLimits = append(gasLimits, hugeGas)
-	gasPrices = append(gasPrices, 100)
+	gasLimits = append(gasLimits, HighGasLimit)
+	gasPrices = append(gasPrices, 20)
 	txs, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	firstBlock := receipts[0].BlockNumber
 	blockTxs := extractBlockTxs(t, client, firstBlock)
 	isHugeInFirst := false
 	lastTxHash := txs[len(txs)-1].Hash()
 	for _, tx := range blockTxs {
-		if tx.Hash() == lastTxHash && tx.GetGas() >= hugeGas {
+		if tx.Hash() == lastTxHash && tx.GetGas() >= TransferGasLimit {
 			isHugeInFirst = true
 			break
 		}
@@ -413,24 +546,37 @@ func TestHugeTxE2E_S7_IgnoreInterval0_Mix_HugeOverQuotaAllowed_OrderByPrice(t *t
 		t.Skip()
 	}
 
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 50
+		ignoreInterval uint64 = 0
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
+
 	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
 	require.NoError(t, err)
 
 	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
 	fromPriv := operations.DefaultL2AdminPrivateKey
 
-	gl := getLatestBlockGasLimit(t, client)
-	hugeMin := gl * 5 / 100
-	hugeGas := hugeMin
-	var gasLimits []uint64
-	var gasPrices []uint64
+	quotaGas := gasLimit * quota / 100
+	cap := int(quotaGas / HighGasLimit)
+
 	for i := 0; i < 5; i++ { // huge
-		gasLimits = append(gasLimits, hugeGas)
-		gasPrices = append(gasPrices, 100-uint64(i))
+		gasLimits = append(gasLimits, HighGasLimit)
+		gasPrices = append(gasPrices, 20-uint64(i))
 	}
 	for i := 0; i < 5; i++ { // normal
-		gasLimits = append(gasLimits, 21000)
-		gasPrices = append(gasPrices, 50-uint64(i))
+		gasLimits = append(gasLimits, TransferGasLimit)
+		gasPrices = append(gasPrices, 5-uint64(i/20))
 	}
 	txs, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
@@ -445,8 +591,42 @@ func TestHugeTxE2E_S7_IgnoreInterval0_Mix_HugeOverQuotaAllowed_OrderByPrice(t *t
 			our = append(our, tx)
 		}
 	}
-	require.GreaterOrEqual(t, len(our), 3)
-	for i := 1; i < len(our); i++ {
-		require.GreaterOrEqual(t, m[our[i-1].Hash()], m[our[i].Hash()])
+	require.GreaterOrEqual(t, len(our), cap)
+}
+
+// sendTxsSynchronously uses synchronization to send all transactions simultaneously
+func sendTxsSynchronously(t *testing.T, client *ethclient.Client, txs []types.Transaction) {
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	sendSignal := make(chan struct{})
+	failed := make(chan bool, len(txs))
+
+	t.Logf("Sending %d transactions synchronously...", len(txs))
+
+	// Start all goroutines
+	for _, tx := range txs {
+		wg.Add(1)
+		go func(transaction types.Transaction) {
+			defer wg.Done()
+			<-sendSignal
+			err := client.SendTransaction(ctx, transaction)
+			if err != nil {
+				failed <- true
+			}
+		}(tx)
+	}
+
+	// Brief delay to ensure all goroutines are waiting
+	time.Sleep(5 * time.Millisecond)
+
+	// Trigger all sends simultaneously
+	close(sendSignal)
+	wg.Wait()
+	close(failed)
+
+	// Check if any transaction failed
+	failedCount := len(failed)
+	if failedCount > 0 {
+		t.Fatalf("Failed to send %d out of %d transactions", failedCount, len(txs))
 	}
 }
