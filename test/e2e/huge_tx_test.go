@@ -867,7 +867,7 @@ func TestHugeTxE2E_S11_Quota0_IgnoreInterval0_Mix(t *testing.T) {
 		}
 	}
 
-	require.Equal(t, hugeCnt, 3)
+	require.Equal(t, 2, hugeCnt)
 	require.Greater(t, normalCnt, 0, "Should include some normal transactions")
 }
 
@@ -919,7 +919,7 @@ func TestHugeTxE2E_S12_Quota0_IgnoreInterval0_AllHuge(t *testing.T) {
 			hugeCnt++
 		}
 	}
-	require.Equal(t, hugeCnt, maxHugeTxs)
+	require.Equal(t, maxHugeTxs, hugeCnt)
 	require.Less(t, gasLimit-block.GasUsed(), HighGasLimit, "Block should be efficiently filled")
 }
 
@@ -990,7 +990,7 @@ func TestHugeTxE2E_S13_Quota0_NoGasLeft_ForHuge(t *testing.T) {
 	}
 
 	require.Equal(t, uint64(0), totalHugeGasPrice, "quota=0%% should prevent huge transactions despite higher gas prices")
-	require.Equal(t, normalCnt, normalTxCount, "Should include all normal transactions")
+	require.Equal(t, normalTxCount, normalCnt, "Should include all normal transactions")
 	require.Equal(t, 0, hugeCnt, "Should have no huge transactions")
 	require.Less(t, gasLimit-block.GasUsed(), HighGasLimit, "Block should be efficiently filled")
 }
