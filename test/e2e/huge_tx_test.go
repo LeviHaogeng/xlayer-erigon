@@ -214,6 +214,43 @@ func getBlockByNumber(t *testing.T, client *ethclient.Client, number *big.Int) *
 	return blk
 }
 
+// sendTxsSynchronously uses synchronization to send all transactions simultaneously
+func sendTxsSynchronously(t *testing.T, client *ethclient.Client, txs []types.Transaction) {
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	sendSignal := make(chan struct{})
+	failed := make(chan bool, len(txs))
+
+	t.Logf("Sending %d transactions synchronously...", len(txs))
+
+	// Start all goroutines
+	for _, tx := range txs {
+		wg.Add(1)
+		go func(transaction types.Transaction) {
+			defer wg.Done()
+			<-sendSignal
+			err := client.SendTransaction(ctx, transaction)
+			if err != nil {
+				failed <- true
+			}
+		}(tx)
+	}
+
+	// Brief delay to ensure all goroutines are waiting
+	time.Sleep(5 * time.Millisecond)
+
+	// Trigger all sends simultaneously
+	close(sendSignal)
+	wg.Wait()
+	close(failed)
+
+	// Check if any transaction failed
+	failedCount := len(failed)
+	if failedCount > 0 {
+		t.Fatalf("Failed to send %d out of %d transactions", failedCount, len(txs))
+	}
+}
+
 func TestHugeTxE2E_S1_NoHuge_AllOrderByPrice(t *testing.T) {
 	if testing.Short() {
 		t.Skip()
@@ -250,7 +287,7 @@ func TestHugeTxE2E_S1_NoHuge_AllOrderByPrice(t *testing.T) {
 	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	block := getBlockByNumber(t, client, bn)
-	require.Less(t, gasLimit-block.GasUsed(), TransferGasLimit)
+	require.Less(t, gasLimit-block.GasUsed(), TransferGasLimit, "Block should be efficiently filled")
 }
 
 func TestHugeTxE2E_S2_HugeUnderQuota_OrderByPrice(t *testing.T) {
@@ -311,7 +348,7 @@ func TestHugeTxE2E_S2_HugeUnderQuota_OrderByPrice(t *testing.T) {
 	txs, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	block := getBlockByNumber(t, client, bn)
-	require.LessOrEqual(t, gasLimit-block.GasUsed(), TransferGasLimit)
+	require.Less(t, gasLimit-block.GasUsed(), TransferGasLimit, "Block should be efficiently filled")
 
 	blockTxs := extractBlockTxs(t, client, bn)
 	// verify all huge txs are included in this block
@@ -387,7 +424,7 @@ func TestHugeTxE2E_S3_HugeOverQuota_LimitHugeCount(t *testing.T) {
 	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	block := getBlockByNumber(t, client, bn)
-	require.LessOrEqual(t, gasLimit-block.GasUsed(), TransferGasLimit)
+	require.Less(t, gasLimit-block.GasUsed(), TransferGasLimit, "Block should be efficiently filled")
 
 	blockTxs := extractBlockTxs(t, client, bn)
 	hugeCnt := 0
@@ -497,11 +534,10 @@ func TestHugeTxE2E_S6_Quota0_NormalFirst_ThenHuge(t *testing.T) {
 		t.Skip()
 	}
 
-	// Configure Apollo for S6 test: threshold=5%, quota=0%, ignoreInterval=5, gasLimit=2100000
 	var (
 		threshold      uint64 = 5
 		quota          uint64 = 0
-		ignoreInterval uint64 = 5
+		ignoreInterval uint64 = 50000
 		gasLimit       uint64 = 2100000
 		gasLimits      []uint64
 		gasPrices      []uint64
@@ -594,39 +630,367 @@ func TestHugeTxE2E_S7_IgnoreInterval0_Mix_HugeOverQuotaAllowed_OrderByPrice(t *t
 	require.GreaterOrEqual(t, len(our), cap)
 }
 
-// sendTxsSynchronously uses synchronization to send all transactions simultaneously
-func sendTxsSynchronously(t *testing.T, client *ethclient.Client, txs []types.Transaction) {
-	ctx := context.Background()
-	var wg sync.WaitGroup
-	sendSignal := make(chan struct{})
-	failed := make(chan bool, len(txs))
-
-	t.Logf("Sending %d transactions synchronously...", len(txs))
-
-	// Start all goroutines
-	for _, tx := range txs {
-		wg.Add(1)
-		go func(transaction types.Transaction) {
-			defer wg.Done()
-			<-sendSignal
-			err := client.SendTransaction(ctx, transaction)
-			if err != nil {
-				failed <- true
-			}
-		}(tx)
+func TestHugeTxE2E_S8_HugeOverQuota_NormalPartialFill_HugeFillsRemainder(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
 	}
 
-	// Brief delay to ensure all goroutines are waiting
-	time.Sleep(5 * time.Millisecond)
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 25
+		ignoreInterval uint64 = 50000
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
 
-	// Trigger all sends simultaneously
-	close(sendSignal)
-	wg.Wait()
-	close(failed)
-
-	// Check if any transaction failed
-	failedCount := len(failed)
-	if failedCount > 0 {
-		t.Fatalf("Failed to send %d out of %d transactions", failedCount, len(txs))
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
 	}
+
+	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
+	require.NoError(t, err)
+	defer client.Close()
+
+	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
+	fromPriv := operations.DefaultL2AdminPrivateKey
+
+	quotaGas := gasLimit * quota / 100
+	quotaCap := int(quotaGas / HighGasLimit) // How many huge txs fit in quota
+
+	// 40 normal transactions (partial fill - doesn't use full block)
+	normalTxCount := 40
+	hugeTxCount := quotaCap + 3 // Exceed quota by 3 transactions
+
+	// Add normal transactions with moderate gas price
+	for i := 0; i < normalTxCount; i++ {
+		gasLimits = append(gasLimits, TransferGasLimit)
+		gasPrices = append(gasPrices, 15) // Moderate gas price
+	}
+
+	// Add huge transactions with high gas price (should be selected first)
+	for i := 0; i < hugeTxCount; i++ {
+		gasLimits = append(gasLimits, HighGasLimit)
+		gasPrices = append(gasPrices, uint64(25-i)) // High gas prices for huge txs
+	}
+
+	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
+	bn := receipts[0].BlockNumber
+	block := getBlockByNumber(t, client, bn)
+
+	blockTxs := extractBlockTxs(t, client, bn)
+	hugeCnt := 0
+	normalCnt := 0
+	for _, tx := range blockTxs {
+		if tx.GetGas() > TransferGasLimit {
+			hugeCnt++
+		} else {
+			normalCnt++
+		}
+	}
+
+	t.Logf("Block results: %d normal txs, %d huge txs, gas used: %d/%d",
+		normalCnt, hugeCnt, block.GasUsed(), gasLimit)
+
+	// Should have more huge txs than quota allows due to remaining gas
+	require.Greater(t, hugeCnt, quotaCap, "Should have more huge txs than quota due to remaining gas")
+	// Should have all normal txs (since they don't fill the block)
+	require.Equal(t, normalTxCount, normalCnt, "Should include all normal transactions")
+}
+
+func TestHugeTxE2E_S9_Quota100_AllNormal_OrderByPrice(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 100
+		ignoreInterval uint64 = 50000
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
+
+	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
+	require.NoError(t, err)
+	defer client.Close()
+
+	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
+	fromPriv := operations.DefaultL2AdminPrivateKey
+
+	// Add 100 normal transactions with varying gas prices
+	for i := 0; i < 100; i++ {
+		gasLimits = append(gasLimits, TransferGasLimit)
+		gasPrices = append(gasPrices, uint64(100-i)) // Decreasing gas prices
+	}
+
+	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
+	bn := receipts[0].BlockNumber
+
+	blockTxs := extractBlockTxs(t, client, bn)
+	hugeCnt := 0
+	normalCnt := 0
+	for _, tx := range blockTxs {
+		if tx.GetGas() > TransferGasLimit {
+			hugeCnt++
+		} else {
+			normalCnt++
+		}
+	}
+
+	require.Equal(t, normalCnt, 100, "Should include all normal transactions")
+}
+
+func TestHugeTxE2E_S10_Quota100_Mix_NormalAndHuge_OrderByPrice(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 100
+		ignoreInterval uint64 = 50000
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
+
+	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
+	require.NoError(t, err)
+	defer client.Close()
+
+	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
+	fromPriv := operations.DefaultL2AdminPrivateKey
+
+	// Add huge transactions with high gas prices
+	for i := 0; i < 5; i++ {
+		gasLimits = append(gasLimits, HighGasLimit)
+		gasPrices = append(gasPrices, 5)
+	}
+
+	// Add normal transactions with lower gas prices
+	for i := 0; i < 95; i++ {
+		gasLimits = append(gasLimits, TransferGasLimit)
+		gasPrices = append(gasPrices, 5)
+	}
+
+	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
+	bn := receipts[0].BlockNumber
+
+	blockTxs := extractBlockTxs(t, client, bn)
+	hugeCnt := 0
+	normalCnt := 0
+	totalGasFromHuge := uint64(0)
+	totalGasFromNormal := uint64(0)
+
+	block := getBlockByNumber(t, client, bn)
+	for _, tx := range blockTxs {
+		if tx.GetGas() > TransferGasLimit {
+			hugeCnt++
+			totalGasFromHuge += tx.GetGas()
+		} else {
+			normalCnt++
+			totalGasFromNormal += tx.GetGas()
+		}
+	}
+
+	require.Greater(t, hugeCnt, 0, "Should have some huge transactions")
+	require.Greater(t, normalCnt, 0, "Should have some normal transactions")
+	require.Less(t, gasLimit-block.GasUsed(), TransferGasLimit, "Block should be efficiently filled")
+}
+
+func TestHugeTxE2E_S11_Quota0_IgnoreInterval0_Mix(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 0
+		ignoreInterval uint64 = 0
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
+
+	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
+	require.NoError(t, err)
+	defer client.Close()
+
+	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
+	fromPriv := operations.DefaultL2AdminPrivateKey
+
+	// Add 50 normal transactions
+	for i := 0; i < 50; i++ {
+		gasLimits = append(gasLimits, TransferGasLimit)
+		gasPrices = append(gasPrices, uint64(5))
+	}
+
+	// Add 3 huge transactions with higher prices
+	for i := 0; i < 3; i++ {
+		gasLimits = append(gasLimits, HighGasLimit)
+		gasPrices = append(gasPrices, uint64(10))
+	}
+
+	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
+	bn := receipts[0].BlockNumber
+	blockTxs := extractBlockTxs(t, client, bn)
+
+	hugeCnt := 0
+	normalCnt := 0
+	for _, tx := range blockTxs {
+		if tx.GetGas() > TransferGasLimit {
+			hugeCnt++
+		} else {
+			normalCnt++
+		}
+	}
+
+	require.Equal(t, hugeCnt, 3)
+	require.Greater(t, normalCnt, 0, "Should include some normal transactions")
+}
+
+func TestHugeTxE2E_S12_Quota0_IgnoreInterval0_AllHuge(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 0
+		ignoreInterval uint64 = 0
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
+
+	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
+	require.NoError(t, err)
+	defer client.Close()
+
+	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
+	fromPriv := operations.DefaultL2AdminPrivateKey
+
+	// Calculate how many huge transactions can fit
+	maxHugeTxs := int(gasLimit / HighGasLimit)
+	hugeTxCount := maxHugeTxs + 2 // Slightly exceed capacity
+
+	// Add only huge transactions
+	for i := 0; i < hugeTxCount; i++ {
+		gasLimits = append(gasLimits, HighGasLimit)
+		gasPrices = append(gasPrices, uint64(30-i)) // Descending prices
+	}
+
+	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
+	bn := receipts[0].BlockNumber
+	block := getBlockByNumber(t, client, bn)
+	blockTxs := extractBlockTxs(t, client, bn)
+
+	hugeCnt := 0
+	for _, tx := range blockTxs {
+		if tx.GetGas() > TransferGasLimit {
+			hugeCnt++
+		}
+	}
+	require.Equal(t, hugeCnt, maxHugeTxs)
+	require.Less(t, gasLimit-block.GasUsed(), HighGasLimit, "Block should be efficiently filled")
+}
+
+func TestHugeTxE2E_S13_Quota0_NoGasLeft_ForHuge(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	var (
+		threshold      uint64 = 5
+		quota          uint64 = 0
+		ignoreInterval uint64 = 50000
+		gasLimit       uint64 = 2100000
+		gasLimits      []uint64
+		gasPrices      []uint64
+	)
+
+	initApolloConfig(t)
+	defer cleanupApolloConfig()
+	if globalApolloCtrl != nil {
+		globalApolloCtrl.SetHugeTxConfigWithGasLimit(threshold, quota, ignoreInterval, gasLimit)
+	}
+
+	client, err := ethclient.Dial(operations.DefaultL2NetworkURL)
+	require.NoError(t, err)
+	defer client.Close()
+
+	to := common.HexToAddress(operations.DefaultL2NewAcc1Address)
+	fromPriv := operations.DefaultL2AdminPrivateKey
+
+	normalTxCount := 80
+	for i := 0; i < normalTxCount; i++ {
+		gasLimits = append(gasLimits, TransferGasLimit)
+		gasPrices = append(gasPrices, 5)
+	}
+
+	hugeTxCount := 3
+	for i := 0; i < hugeTxCount; i++ {
+		gasLimits = append(gasLimits, HighGasLimit)
+		gasPrices = append(gasPrices, 10)
+	}
+
+	txs, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
+	bn := receipts[0].BlockNumber
+	block := getBlockByNumber(t, client, bn)
+	blockTxs := extractBlockTxs(t, client, bn)
+
+	// Create a map to track gas prices by transaction hash
+	priceMap := make(map[[32]byte]uint64)
+	for i := range txs {
+		priceMap[txs[i].Hash()] = gasPrices[i]
+	}
+
+	hugeCnt := 0
+	normalCnt := 0
+	totalHugeGasPrice := uint64(0)
+	totalNormalGasPrice := uint64(0)
+
+	for _, tx := range blockTxs {
+		txPrice := priceMap[tx.Hash()]
+		if tx.GetGas() > TransferGasLimit {
+			hugeCnt++
+			totalHugeGasPrice += txPrice
+		} else {
+			normalCnt++
+			totalNormalGasPrice += txPrice
+		}
+	}
+
+	require.Equal(t, uint64(0), totalHugeGasPrice, "quota=0%% should prevent huge transactions despite higher gas prices")
+	require.Equal(t, normalCnt, normalTxCount, "Should include all normal transactions")
+	require.Equal(t, 0, hugeCnt, "Should have no huge transactions")
+	require.Less(t, gasLimit-block.GasUsed(), HighGasLimit, "Block should be efficiently filled")
 }
