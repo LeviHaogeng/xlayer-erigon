@@ -5,9 +5,12 @@ package test
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"testing"
+	"time"
 
+	"github.com/IBM/sarama"
 	"github.com/holiman/uint256"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon/common"
@@ -18,6 +21,7 @@ import (
 	kafkaTypes "github.com/ledgerwatch/erigon/zk/realtime/kafka/types"
 	realtimeTypes "github.com/ledgerwatch/erigon/zk/realtime/types"
 	zktypes "github.com/ledgerwatch/erigon/zk/types"
+	"github.com/stretchr/testify/require"
 	"gotest.tools/v3/assert"
 )
 
@@ -107,29 +111,22 @@ func TestKafka(t *testing.T) {
 		ClientID:         "xlayer-test-consumer",
 		GroupID:          "xlayer-test-consumer-1",
 	}
+
+	err := createKafkaTopics(cfg)
+	assert.NilError(t, err)
+
 	producer, err := kafka.NewKafkaProducer(cfg, context.Background(), nil)
 	assert.NilError(t, err)
 
-	currBlockHeader := ethTypes.CopyHeader(blockHeader)
 	for i := 1; i <= 10; i++ {
 		err = producer.SendKafkaTransaction(uint64(i), rightvrsTx, rightvrsTxReceipt, rightvrsTxInnerTxs, rightvrsTxChangeset)
 		assert.NilError(t, err)
 
-		var prevBlockHeader *ethTypes.Header
-		if i != 1 {
-			prevBlockHeader = ethTypes.CopyHeader(currBlockHeader)
-		}
-		currBlockHeader.Number = big.NewInt(int64(i))
-		blockMsg := kafkaTypes.BlockMessage{
-			Header: currBlockHeader,
-			PrevBlockInfo: &realtimeTypes.BlockInfo{
-				Header:  prevBlockHeader,
-				TxCount: int64(i),
-				Hash:    testHash,
-			},
-		}
-		assert.NilError(t, err)
-		err = producer.SendKafkaBlockMessage(blockMsg)
+		err = producer.SendKafkaBlockMessage(&realtimeTypes.BlockInfo{
+			Header:  blockHeader,
+			TxCount: int64(i),
+			Hash:    testHash,
+		})
 		assert.NilError(t, err)
 
 		err = producer.SendKafkaErrorTrigger(uint64(i))
@@ -149,7 +146,7 @@ func TestKafka(t *testing.T) {
 	consumer, err := kafka.NewKafkaConsumer(cfg, false)
 	assert.NilError(t, err)
 	ctx, ctxWithCancel := context.WithCancel(context.Background())
-	headersChan := make(chan kafkaTypes.BlockMessage, 20)
+	headersChan := make(chan realtimeTypes.BlockInfo, 20)
 	txMsgsChan := make(chan kafkaTypes.TransactionMessage, 20)
 	errorMsgsChan := make(chan kafkaTypes.ErrorTriggerMessage, 20)
 	errorChan := make(chan error, 10)
@@ -161,7 +158,7 @@ func TestKafka(t *testing.T) {
 		case err := <-errorChan:
 			t.Fatalf("Received error from consumer: %v", err)
 		case txMsg := <-txMsgsChan:
-			AssertCommonTx(t, txMsg, rightvrsTx, uint64(i), ethTypes.LegacyTxType)
+			AssertCommonTxWithoutBlockNumber(t, txMsg, rightvrsTx, ethTypes.LegacyTxType)
 			AssertReceipt(t, txMsg, rightvrsTxReceipt)
 			AssertInnerTxs(t, txMsg, rightvrsTxInnerTxs)
 			AssertChangeseet(t, txMsg, rightvrsTxChangeset)
@@ -173,7 +170,7 @@ func TestKafka(t *testing.T) {
 		case err := <-errorChan:
 			t.Fatalf("Received error from consumer: %v", err)
 		case txMsg := <-txMsgsChan:
-			AssertCommonTx(t, txMsg, accessListTx, uint64(i), ethTypes.AccessListTxType)
+			AssertCommonTxWithoutBlockNumber(t, txMsg, accessListTx, ethTypes.AccessListTxType)
 			AssertAccessList(t, txMsg.AccessList)
 			AssertReceipt(t, txMsg, rightvrsTxReceipt)
 			AssertInnerTxs(t, txMsg, rightvrsTxInnerTxs)
@@ -182,23 +179,14 @@ func TestKafka(t *testing.T) {
 	}
 
 	// Verify header messages
-	currBlockHeader = ethTypes.CopyHeader(blockHeader)
 	for i := 1; i <= 10; i++ {
 		select {
 		case err := <-errorChan:
 			t.Fatalf("Received error from consumer: %v", err)
 		case rcvHeader := <-headersChan:
-			var prevBlockHeader *ethTypes.Header
-			if i != 1 {
-				prevBlockHeader = ethTypes.CopyHeader(currBlockHeader)
-			}
-			currBlockHeader.Number = big.NewInt(int64(i))
-			header, prevBlockInfo, err := rcvHeader.GetBlockInfo()
-			assert.NilError(t, err)
-			AssertHeader(t, currBlockHeader, header)
-			AssertHeader(t, prevBlockHeader, prevBlockInfo.Header)
-			assert.Equal(t, prevBlockInfo.TxCount, int64(i))
-			assert.Equal(t, prevBlockInfo.Hash, testHash)
+			AssertHeader(t, blockHeader, rcvHeader.Header)
+			assert.Equal(t, rcvHeader.TxCount, int64(i))
+			assert.Equal(t, rcvHeader.Hash, testHash)
 		}
 	}
 
@@ -215,4 +203,85 @@ func TestKafka(t *testing.T) {
 	ctxWithCancel()
 	err = consumer.Close()
 	assert.NilError(t, err)
+}
+
+func TestStressTestKafkaProducer(t *testing.T) {
+	rightvrsTx.SetSender(testFromAddr)
+	cfg := kafka.KafkaConfig{
+		BootstrapServers: []string{"0.0.0.0:9095"},
+		BlockTopic:       "xlayer-test-block",
+		TxTopic:          "xlayer-test-tx",
+		ErrorTopic:       "xlayer-test-error",
+		ClientID:         "xlayer-test-consumer",
+		GroupID:          "xlayer-test-consumer-1",
+	}
+
+	err := createKafkaTopics(cfg)
+	assert.NilError(t, err)
+
+	successChan := make(chan struct{}, 10000)
+	producer, err := kafka.NewKafkaProducer(cfg, context.Background(), successChan)
+	assert.NilError(t, err)
+
+	startTime := time.Now()
+	for i := 1; i <= 1000; i++ {
+		err = producer.SendKafkaTransaction(uint64(i), rightvrsTx, rightvrsTxReceipt, rightvrsTxInnerTxs, rightvrsTxChangeset)
+		assert.NilError(t, err)
+	}
+
+	// Sending 1000 messages should not be blocking, and should take less than 50ms
+	elapsed := time.Since(startTime)
+	fmt.Printf("Batch producer send took %s to dispatch 1000 messages\n", elapsed)
+	require.Less(t, elapsed, 50*time.Millisecond)
+
+	for i := 0; i < 1000; i++ {
+		select {
+		case <-successChan:
+		case <-time.After(1 * time.Second):
+			t.Fatalf("Timeout waiting for success message %d", i)
+		}
+	}
+	elapsed = time.Since(startTime)
+	fmt.Printf("Producer took %s to send 1000 messages to kafka broker\n", elapsed)
+	require.Less(t, elapsed, 100*time.Millisecond)
+
+	err = producer.Close()
+	assert.NilError(t, err)
+}
+
+// createKafkaTopics creates the required Kafka topics for testing
+func createKafkaTopics(config kafka.KafkaConfig) error {
+	// Create admin client
+	adminClient, err := sarama.NewClusterAdmin(config.BootstrapServers, nil)
+	if err != nil {
+		return err
+	}
+	defer adminClient.Close()
+
+	// Define topics to create
+	topics := []string{config.BlockTopic, config.TxTopic, config.ErrorTopic}
+
+	for _, topic := range topics {
+		// Check if topic already exists
+		metadata, err := adminClient.DescribeConfig(sarama.ConfigResource{
+			Type: sarama.TopicResource,
+			Name: topic,
+		})
+
+		if err != nil {
+			// Topic doesn't exist, create it
+			err = adminClient.CreateTopic(topic, &sarama.TopicDetail{
+				NumPartitions:     1,
+				ReplicationFactor: 1,
+			}, false)
+			if err != nil {
+				return err
+			}
+		} else {
+			// Topic exists, just verify it's accessible
+			_ = metadata
+		}
+	}
+	time.Sleep(1 * time.Second)
+	return nil
 }
