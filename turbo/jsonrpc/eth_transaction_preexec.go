@@ -252,6 +252,15 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, b
 
 	blockBigNumber := new(big.Int).Set(header.Number)
 
+	// Get chain config once outside the loop for better performance
+	chainConfig, err := api.chainConfig(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get chain config: %v", err)
+	}
+
+	// Set default chainId from config (can be overridden per transaction)
+	defaultChainId := chainConfig.ChainID
+
 	// Setup context with timeout
 	timeout := 5 * time.Second
 	if len(origins) > 0 {
@@ -295,19 +304,8 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, b
 			origin.Gas = (*hexutil.Uint64)(&gas)
 		}
 
-		// Get chain config
-		chainConfig, err := api.chainConfig(ctx, tx)
-		if err != nil {
-			preError := PreError{
-				Code: UnKnownErrCode,
-				Msg:  fmt.Sprintf("failed to get chain config: %v", err),
-			}
-			preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
-			preResList = append(preResList, preResult)
-			continue
-		}
-
-		chainId := chainConfig.ChainID
+		// Use default chainId or override if specified in transaction
+		chainId := defaultChainId
 		if origin.ChainId != nil {
 			chainId = origin.ChainId
 		}
