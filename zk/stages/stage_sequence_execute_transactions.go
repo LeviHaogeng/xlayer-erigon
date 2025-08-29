@@ -24,7 +24,7 @@ import (
 	"github.com/ledgerwatch/log/v3"
 )
 
-func getNextPoolTransactions(ctx context.Context, cfg SequenceBlockCfg, executionAt, forkId uint64, alreadyYielded mapset.Set[[32]byte]) ([]types.Transaction, []common.Hash, bool, error) {
+func getNextPoolTransactions(ctx context.Context, cfg SequenceBlockCfg, executionAt, nextBlockNumber, forkId uint64, alreadyYielded mapset.Set[[32]byte]) ([]types.Transaction, []common.Hash, bool, error) {
 	var ids []common.Hash
 	var transactions []types.Transaction
 	var allConditionsOk bool
@@ -42,7 +42,7 @@ func getNextPoolTransactions(ctx context.Context, cfg SequenceBlockCfg, executio
 	// For X Layer, optimize getTransactions
 	slots := types2.TxsRlp{}
 	if err := cfg.txPoolDb.View(ctx, func(poolTx kv.Tx) error {
-		if allConditionsOk, _, err = cfg.txPool.YieldBest(cfg.yieldSize, &slots, poolTx, executionAt, gasLimit, 0, alreadyYielded); err != nil {
+		if allConditionsOk, _, err = cfg.txPool.YieldBest(cfg.yieldSize, &slots, poolTx, executionAt, nextBlockNumber, gasLimit, 0, alreadyYielded); err != nil {
 			return err
 		}
 		return nil

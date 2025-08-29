@@ -23,6 +23,7 @@ const (
 
 	DefaultL2NetworkURL        = "http://localhost:8124"
 	DefaultL2ChainID    uint64 = 195
+	DefaultL2WSURL             = "ws://localhost:8547"
 
 	DefaultL2MetricsPrometheusURL = "http://127.0.0.1:9092/debug/metrics/prometheus"
 	DefaultL2MetricsURL           = "http://127.0.0.1:9092/debug/metrics"

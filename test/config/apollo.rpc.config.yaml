@@ -24,8 +24,8 @@ zkevm.datastream-version: 2
 
 log.console.verbosity: info
 
-zkevm.sequencer-block-seal-time: "400ms"
-zkevm.sequencer-batch-seal-time: "60s"
+zkevm.sequencer-block-seal-time: "6s"
+zkevm.sequencer-batch-seal-time: "12s"
 zkevm.sequencer-batch-sleep-duration: "0s"
 
 zkevm.data-stream-host: "localhost"
@@ -71,8 +71,6 @@ txpool.globalslots: 100000
 networkid: 195
 
 zkevm.pool-manager-url: http://xlayer-pool-manager:8545
-
-# http.methodratelimit: "{\"methods\":[\"eth_syncing\"],\"count\":10,\"bucket\":1}"
 #http.apikeys: |
 #  {"project":"project1","key":"944cd2a6939eb23053289d9b91d6c498","timeout":"2033-12-12","methods":["eth_syncing"],"count":5,"bucket":1}
 
