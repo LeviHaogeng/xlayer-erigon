@@ -832,7 +832,7 @@ func convertCallsToInnerTxs(calls []CallTracerResult, lastDepth int64, lastDepth
 			innerTx.CodeAddress = common.HexToAddress(callTx.To).Hex() // Convert to checksummed address
 		}
 
-		// 记录深度
+		// Record depth
 		depthIndexRoot := fmt.Sprintf("%s_%d", lastDepthIndexRoot, index)
 		// set name
 		innerTx.Name = fmt.Sprintf("%s%s", innerTx.CallType, depthIndexRoot)
@@ -876,7 +876,7 @@ func preArgsCheck(ibs *state.IntraBlockState, arg PreArgs) error {
 		return fmt.Errorf("EIP-7702 transactions are not supported: authorizationList should not be set")
 	}
 
-	// 从pending高度获取state时，需要校验nonce
+	// When obtaining state from the pending block height, the nonce must be validated
 	msgFrom := *arg.From
 	msgNonce := uint64(*arg.Nonce)
 	stNonce := ibs.GetNonce(msgFrom)
