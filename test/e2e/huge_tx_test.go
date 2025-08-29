@@ -214,41 +214,82 @@ func getBlockByNumber(t *testing.T, client *ethclient.Client, number *big.Int) *
 	return blk
 }
 
-// sendTxsSynchronously uses synchronization to send all transactions simultaneously
+// checkHugeTxsPrioritized verifies that huge transactions appear in the first few positions
+func checkHugeTxsPrioritized(t *testing.T, blockTxs []types.Transaction, expectedHugeCount int, testName string) {
+	hugeTxsInFront := 0
+	for i := 0; i < len(blockTxs) && i < expectedHugeCount; i++ { // Check first few positions
+		if blockTxs[i].GetGas() > TransferGasLimit {
+			hugeTxsInFront++
+		}
+	}
+
+	t.Logf("%s: Found %d huge txs in first %d positions", testName, hugeTxsInFront, expectedHugeCount)
+
+	require.GreaterOrEqual(t, hugeTxsInFront, expectedHugeCount,
+		"%s: Huge transactions should be prioritized and appear in front positions", testName)
+}
+
+// checkNormalTxAtPosition verifies that the transaction at specified position is a normal transaction
+func checkNormalTxAtPosition(t *testing.T, blockTxs []types.Transaction, position int, testName string) {
+	require.Greater(t, len(blockTxs), position-1, "%s: Block should contain at least %d transactions", testName, position)
+
+	targetTx := blockTxs[position-1] // Convert 1-based position to 0-based index
+	isTargetTxNormal := targetTx.GetGas() <= TransferGasLimit
+
+	t.Logf("%s: Transaction at position %d gas limit: %d (normal: %v)",
+		testName, position, targetTx.GetGas(), isTargetTxNormal)
+
+	require.True(t, isTargetTxNormal,
+		"%s: Transaction at position %d should be normal (gas <= %d), but got gas = %d",
+		testName, position, TransferGasLimit, targetTx.GetGas())
+}
+
+// sendTxsSynchronously uses synchronization to send all transactions and wait for them to enter pending pool
 func sendTxsSynchronously(t *testing.T, client *ethclient.Client, txs []types.Transaction) {
 	ctx := context.Background()
 	var wg sync.WaitGroup
-	sendSignal := make(chan struct{})
 	failed := make(chan bool, len(txs))
 
 	t.Logf("Sending %d transactions synchronously...", len(txs))
 
-	// Start all goroutines
+	// Start all goroutines to send transactions
 	for _, tx := range txs {
 		wg.Add(1)
 		go func(transaction types.Transaction) {
 			defer wg.Done()
-			<-sendSignal
 			err := client.SendTransaction(ctx, transaction)
 			if err != nil {
 				failed <- true
+				return
 			}
+
+			// Wait for transaction to appear in pending pool
+			txHash := transaction.Hash()
+			maxRetries := 5
+			for i := 0; i < maxRetries; i++ {
+				_, pending, err := client.TransactionByHash(ctx, txHash)
+				if err == nil && pending {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			// If we reach here, transaction didn't appear in pending pool within timeout
+			t.Logf("Warning: Transaction %s didn't appear in pending pool within 50ms", txHash.Hex())
+			failed <- true
 		}(tx)
 	}
 
-	// Brief delay to ensure all goroutines are waiting
-	time.Sleep(5 * time.Millisecond)
-
-	// Trigger all sends simultaneously
-	close(sendSignal)
 	wg.Wait()
 	close(failed)
 
 	// Check if any transaction failed
 	failedCount := len(failed)
 	if failedCount > 0 {
-		t.Fatalf("Failed to send %d out of %d transactions", failedCount, len(txs))
+		t.Fatalf("Failed to send %d out of %d transactions or they didn't enter pending pool", failedCount, len(txs))
 	}
+
+	t.Logf("All %d transactions successfully entered pending pool", len(txs))
 }
 
 func TestHugeTxE2E_S1_NoHuge_AllOrderByPrice(t *testing.T) {
@@ -297,7 +338,7 @@ func TestHugeTxE2E_S2_HugeUnderQuota_OrderByPrice(t *testing.T) {
 	var (
 		threshold      uint64 = 5
 		quota          uint64 = 50
-		ignoreInterval uint64 = 5
+		ignoreInterval uint64 = 50000
 		gasLimit       uint64 = 2100000
 		gasLimits      []uint64
 		gasPrices      []uint64
@@ -343,14 +384,16 @@ func TestHugeTxE2E_S2_HugeUnderQuota_OrderByPrice(t *testing.T) {
 		gasPrices = append(gasPrices, uint64(5-i/20)) // Lower gas prices for normal txs (5 Gwei)
 	}
 
-	t.Logf("Test setup: %d huge txs (within quota %d), %d normal txs, total %d txs",
-		hugeTxCount, cap, normalTxCount, len(gasLimits))
 	txs, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	block := getBlockByNumber(t, client, bn)
 	require.Less(t, gasLimit-block.GasUsed(), TransferGasLimit, "Block should be efficiently filled")
 
 	blockTxs := extractBlockTxs(t, client, bn)
+
+	// Check that huge transactions are prioritized (appear in front positions)
+	checkHugeTxsPrioritized(t, blockTxs, hugeTxCount, "S2_HugeUnderQuota")
+
 	// verify all huge txs are included in this block
 	hugeSet := make(map[[32]byte]struct{})
 	for i := 0; i < cap; i++ {
@@ -419,14 +462,15 @@ func TestHugeTxE2E_S3_HugeOverQuota_LimitHugeCount(t *testing.T) {
 		gasPrices = append(gasPrices, uint64(5-i/20)) // Lower gas prices for normal txs (5 Gwei)
 	}
 
-	t.Logf("Test setup: %d huge txs (quota allows %d), %d normal txs, total %d txs",
-		hugeTxCount, cap, normalTxCount, len(gasLimits))
 	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	block := getBlockByNumber(t, client, bn)
 	require.Less(t, gasLimit-block.GasUsed(), TransferGasLimit, "Block should be efficiently filled")
 
 	blockTxs := extractBlockTxs(t, client, bn)
+
+	checkHugeTxsPrioritized(t, blockTxs, cap, "S3_HugeOverQuota_LimitHugeCount")
+
 	hugeCnt := 0
 	for _, tx := range blockTxs {
 		if tx.GetGas() > TransferGasLimit {
@@ -470,6 +514,10 @@ func TestHugeTxE2E_S4_AllHuge_ExceedQuota_OrderByPrice(t *testing.T) {
 	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	blockTxs := extractBlockTxs(t, client, bn)
+
+	// Check that huge transactions are prioritized (all should be huge, ordered by price)
+	checkHugeTxsPrioritized(t, blockTxs, int(gasLimit/HighGasLimit), "S4_AllHuge_ExceedQuota")
+
 	hugeCnt := 0
 	for _, tx := range blockTxs {
 		if tx.GetGas() > TransferGasLimit {
@@ -516,6 +564,10 @@ func TestHugeTxE2E_S5_AllHuge_Quota100_OrderByPrice(t *testing.T) {
 	txs, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	blockTxs := extractBlockTxs(t, client, bn)
+
+	// Check that huge transactions are prioritized (all should be huge, ordered by price)
+	checkHugeTxsPrioritized(t, blockTxs, cap, "S5_AllHuge_Quota100")
+
 	var our []types.Transaction
 	m := make(map[[32]byte]uint64)
 	for i := range txs {
@@ -566,6 +618,10 @@ func TestHugeTxE2E_S6_Quota0_NormalFirst_ThenHuge(t *testing.T) {
 	txs, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	firstBlock := receipts[0].BlockNumber
 	blockTxs := extractBlockTxs(t, client, firstBlock)
+
+	// Check that normal transactions are prioritized (first tx should be normal)
+	checkNormalTxAtPosition(t, blockTxs, 1, "S6_Quota0_NormalFirst")
+
 	isHugeInFirst := false
 	lastTxHash := txs[len(txs)-1].Hash()
 	for _, tx := range blockTxs {
@@ -617,6 +673,10 @@ func TestHugeTxE2E_S7_IgnoreInterval0_Mix_HugeOverQuotaAllowed_OrderByPrice(t *t
 	txs, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
 	blockTxs := extractBlockTxs(t, client, bn)
+
+	// Check that huge transactions are prioritized (higher price: 20-16 vs 5-4)
+	checkHugeTxsPrioritized(t, blockTxs, int(gasLimit/HighGasLimit), "S7_IgnoreInterval0_Mix")
+
 	var our []types.Transaction
 	m := make(map[[32]byte]uint64)
 	for i := range txs {
@@ -627,7 +687,7 @@ func TestHugeTxE2E_S7_IgnoreInterval0_Mix_HugeOverQuotaAllowed_OrderByPrice(t *t
 			our = append(our, tx)
 		}
 	}
-	require.GreaterOrEqual(t, len(our), cap)
+	require.Greater(t, len(our), cap)
 }
 
 func TestHugeTxE2E_S8_HugeOverQuota_NormalPartialFill_HugeFillsRemainder(t *testing.T) {
@@ -658,11 +718,11 @@ func TestHugeTxE2E_S8_HugeOverQuota_NormalPartialFill_HugeFillsRemainder(t *test
 	fromPriv := operations.DefaultL2AdminPrivateKey
 
 	quotaGas := gasLimit * quota / 100
-	quotaCap := int(quotaGas / HighGasLimit) // How many huge txs fit in quota
+	cap := int(quotaGas / HighGasLimit) // How many huge txs fit in quota
 
 	// 40 normal transactions (partial fill - doesn't use full block)
 	normalTxCount := 40
-	hugeTxCount := quotaCap + 3 // Exceed quota by 3 transactions
+	hugeTxCount := cap + 3 // Exceed quota by 3 transactions
 
 	// Add normal transactions with moderate gas price
 	for i := 0; i < normalTxCount; i++ {
@@ -681,6 +741,10 @@ func TestHugeTxE2E_S8_HugeOverQuota_NormalPartialFill_HugeFillsRemainder(t *test
 	block := getBlockByNumber(t, client, bn)
 
 	blockTxs := extractBlockTxs(t, client, bn)
+
+	// Check that huge transactions are prioritized (higher price: 25-22 vs 15)
+	checkHugeTxsPrioritized(t, blockTxs, 2, "S8_HugeOverQuota_NormalPartialFill")
+
 	hugeCnt := 0
 	normalCnt := 0
 	for _, tx := range blockTxs {
@@ -695,7 +759,7 @@ func TestHugeTxE2E_S8_HugeOverQuota_NormalPartialFill_HugeFillsRemainder(t *test
 		normalCnt, hugeCnt, block.GasUsed(), gasLimit)
 
 	// Should have more huge txs than quota allows due to remaining gas
-	require.Greater(t, hugeCnt, quotaCap, "Should have more huge txs than quota due to remaining gas")
+	require.Greater(t, hugeCnt, cap, "Should have more huge txs than quota due to remaining gas")
 	// Should have all normal txs (since they don't fill the block)
 	require.Equal(t, normalTxCount, normalCnt, "Should include all normal transactions")
 }
@@ -855,7 +919,11 @@ func TestHugeTxE2E_S11_Quota0_IgnoreInterval0_Mix(t *testing.T) {
 
 	_, receipts := buildAndSendTxs(t, client, fromPriv, to, gasLimits, gasPrices)
 	bn := receipts[0].BlockNumber
+	block := getBlockByNumber(t, client, bn)
 	blockTxs := extractBlockTxs(t, client, bn)
+
+	// Check that huge transactions are prioritized (higher price: 10 vs 5, ignoreInterval=0 overrides quota=0%)
+	checkHugeTxsPrioritized(t, blockTxs, 3, "S11_Quota0_IgnoreInterval0")
 
 	hugeCnt := 0
 	normalCnt := 0
@@ -867,8 +935,9 @@ func TestHugeTxE2E_S11_Quota0_IgnoreInterval0_Mix(t *testing.T) {
 		}
 	}
 
-	require.Equal(t, 2, hugeCnt)
+	require.Equal(t, 3, hugeCnt)
 	require.Greater(t, normalCnt, 0, "Should include some normal transactions")
+	require.Less(t, gasLimit-block.GasUsed(), TransferGasLimit, "Block should be efficiently filled")
 }
 
 func TestHugeTxE2E_S12_Quota0_IgnoreInterval0_AllHuge(t *testing.T) {
@@ -899,8 +968,8 @@ func TestHugeTxE2E_S12_Quota0_IgnoreInterval0_AllHuge(t *testing.T) {
 	fromPriv := operations.DefaultL2AdminPrivateKey
 
 	// Calculate how many huge transactions can fit
-	maxHugeTxs := int(gasLimit / HighGasLimit)
-	hugeTxCount := maxHugeTxs + 2 // Slightly exceed capacity
+	cap := int(gasLimit / HighGasLimit)
+	hugeTxCount := cap + 2 // Slightly exceed capacity
 
 	// Add only huge transactions
 	for i := 0; i < hugeTxCount; i++ {
@@ -913,13 +982,16 @@ func TestHugeTxE2E_S12_Quota0_IgnoreInterval0_AllHuge(t *testing.T) {
 	block := getBlockByNumber(t, client, bn)
 	blockTxs := extractBlockTxs(t, client, bn)
 
+	// Check that huge transactions are prioritized (all huge, ordered by price)
+	checkHugeTxsPrioritized(t, blockTxs, cap, "S12_Quota0_IgnoreInterval0_AllHuge")
+
 	hugeCnt := 0
 	for _, tx := range blockTxs {
 		if tx.GetGas() > TransferGasLimit {
 			hugeCnt++
 		}
 	}
-	require.Equal(t, maxHugeTxs, hugeCnt)
+	require.Equal(t, cap, hugeCnt)
 	require.Less(t, gasLimit-block.GasUsed(), HighGasLimit, "Block should be efficiently filled")
 }
 
