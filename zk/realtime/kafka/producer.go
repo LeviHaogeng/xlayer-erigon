@@ -2,12 +2,11 @@ package kafka
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/IBM/sarama"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
-	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/types"
 	kafkaTypes "github.com/ledgerwatch/erigon/zk/realtime/kafka/types"
 	realtimeTypes "github.com/ledgerwatch/erigon/zk/realtime/types"
@@ -16,30 +15,22 @@ import (
 
 // KafkaProducer represents a Kafka producer client for sending transaction messages
 type KafkaProducer struct {
-	producer sarama.SyncProducer
+	producer *BatchProducer
 	config   KafkaConfig
 	ctx      context.Context
-	db       kv.RoDB
 }
 
-func NewKafkaProducer(config KafkaConfig, ctx context.Context, db kv.RoDB) (*KafkaProducer, error) {
-	saramaConfig := sarama.NewConfig()
-	saramaConfig.Version = DEFAULT_VERSION
-	saramaConfig.ClientID = config.ClientID
-	saramaConfig.Producer.Return.Successes = true
-	saramaConfig.Producer.Return.Errors = true
-
+func NewKafkaProducer(config KafkaConfig, ctx context.Context, successChan chan struct{}) (*KafkaProducer, error) {
 	// Create sync producer
-	producer, err := sarama.NewSyncProducer(config.BootstrapServers, saramaConfig)
+	producer, err := NewBatchProducer(ctx, config, successChan)
 	if err != nil {
-		return nil, fmt.Errorf("error creating Kafka producer: %v", err)
+		return nil, err
 	}
 
 	return &KafkaProducer{
 		producer: producer,
 		config:   config,
 		ctx:      ctx,
-		db:       db,
 	}, nil
 }
 
@@ -67,7 +58,7 @@ func (client *KafkaProducer) SendKafkaTransaction(blockNumber uint64, tx types.T
 	}
 
 	// Send message
-	_, _, err = client.producer.SendMessage(kafkaMsg)
+	err = client.producer.SendMessage(kafkaMsg)
 	if err != nil {
 		return fmt.Errorf("error sending message to Kafka: %v", err)
 	}
@@ -75,22 +66,31 @@ func (client *KafkaProducer) SendKafkaTransaction(blockNumber uint64, tx types.T
 	return nil
 }
 
-func (client *KafkaProducer) SendKafkaBlockInfo(header *types.Header) error {
-	prevBlockInfo, err := client.getPrevBlockData(header.Number.Uint64())
-	if err != nil {
-		return err
-	}
-	msg := kafkaTypes.BlockMessage{
-		Header:        header,
-		PrevBlockInfo: prevBlockInfo,
+func (client *KafkaProducer) SendKafkaNewBlockInfo(header *types.Header) error {
+	msg := &realtimeTypes.BlockInfo{
+		Header:  header,
+		TxCount: -1,
+		Hash:    libcommon.Hash{},
 	}
 
 	return client.SendKafkaBlockMessage(msg)
 }
 
-func (client *KafkaProducer) SendKafkaBlockMessage(msg kafkaTypes.BlockMessage) error {
+func (client *KafkaProducer) SendKafkaConfirmedBlockInfo(block *types.Block) error {
+	// Get transaction count for the block
+	blockTxCount := int64(len(block.Transactions()))
+	msg := &realtimeTypes.BlockInfo{
+		Header:  block.Header(),
+		TxCount: blockTxCount,
+		Hash:    block.Hash(),
+	}
+
+	return client.SendKafkaBlockMessage(msg)
+}
+
+func (client *KafkaProducer) SendKafkaBlockMessage(msg *realtimeTypes.BlockInfo) error {
 	// Marshal message to JSON
-	jsonData, err := msg.MarshalJSON()
+	jsonData, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("error marshaling block message: %v", err)
 	}
@@ -103,7 +103,7 @@ func (client *KafkaProducer) SendKafkaBlockMessage(msg kafkaTypes.BlockMessage) 
 	}
 
 	// Send message
-	_, _, err = client.producer.SendMessage(kafkaMsg)
+	err = client.producer.SendMessage(kafkaMsg)
 	if err != nil {
 		return fmt.Errorf("error sending message to Kafka: %v", err)
 	}
@@ -129,43 +129,10 @@ func (client *KafkaProducer) SendKafkaErrorTrigger(blockNumber uint64) error {
 	}
 
 	// Send message
-	_, _, err = client.producer.SendMessage(kafkaMsg)
+	err = client.producer.SendMessage(kafkaMsg)
 	if err != nil {
 		return fmt.Errorf("error sending message to Kafka: %v", err)
 	}
 
 	return nil
-}
-
-// getPrevBlockData retrieves the previous block data from the chain db
-func (client *KafkaProducer) getPrevBlockData(blockNumber uint64) (*realtimeTypes.BlockInfo, error) {
-	if blockNumber <= 1 {
-		// Genesis block
-		return &realtimeTypes.BlockInfo{
-			Header:  nil,
-			TxCount: -1,
-			Hash:    libcommon.Hash{},
-		}, nil
-	}
-
-	tx, err := client.db.BeginRo(client.ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	prevBlockNumber := blockNumber - 1
-	prevBlock, err := rawdb.ReadBlockByNumber(tx, prevBlockNumber)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get transaction count for the previous block
-	prevBlockTxCount := int64(len(prevBlock.Transactions()))
-
-	return &realtimeTypes.BlockInfo{
-		Header:  prevBlock.Header(),
-		TxCount: prevBlockTxCount,
-		Hash:    prevBlock.Hash(),
-	}, nil
 }
