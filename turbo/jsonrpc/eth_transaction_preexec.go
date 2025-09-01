@@ -32,8 +32,6 @@ const (
 	InsufficientBalanceErrCode = 1001
 	RevertedErrCode            = 1002
 	CheckPreArgsErrCode        = 1003
-
-	MaxGasLimit = 30000000
 )
 
 // PreExecInnerTx defines the structure for inner transactions returned by TransactionPreExec RPC
@@ -269,6 +267,16 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, b
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Get current block gas limit
+	currentBlockGasLimit, err := api.GetBlockGasLimit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block gas limit: %v", err)
+	}
+	blockGasLimit := currentBlockGasLimit.ToInt().Uint64()
+
+	// Track cumulative gas usage across all transactions in the batch
+	var cumulativeGasUsed uint64
+
 	// Process each transaction
 	for i, origin := range origins {
 		var gasUsed uint64
@@ -295,13 +303,30 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, b
 			continue
 		}
 
-		// Set default gas if not provided
+		// Calculate remaining gas limit for this transaction
+		remainingGasLimit := blockGasLimit - cumulativeGasUsed
+
+		// Check if there's any gas left for this transaction
+		if remainingGasLimit == 0 {
+			preError := PreError{
+				Code: RevertedErrCode,
+				Msg:  fmt.Sprintf("block gas limit exceeded: no gas remaining for transaction %d", i),
+			}
+			preResult := toPreResult(nil, nil, nil, preError, gasUsed, blockBigNumber)
+			preResList = append(preResList, preResult)
+			continue
+		}
+
+		// Set default gas if not provided, but cap it at remaining gas limit
 		if origin.Gas == nil {
-			gas := uint64(MaxGasLimit)
+			gas := remainingGasLimit
 			origin.Gas = (*hexutil.Uint64)(&gas)
-		} else if uint64(*origin.Gas) > MaxGasLimit {
-			gas := uint64(MaxGasLimit)
+		} else if uint64(*origin.Gas) > remainingGasLimit {
+			// If requested gas exceeds remaining limit, cap it at remaining limit
+			gas := remainingGasLimit
 			origin.Gas = (*hexutil.Uint64)(&gas)
+			log.Warn("TransactionPreExec: gas limit capped", "requestID", requestID, "txIndex", i,
+				"requestedGas", uint64(*origin.Gas), "cappedGas", gas, "remainingGas", remainingGasLimit)
 		}
 
 		// Use default chainId or override if specified in transaction
@@ -403,8 +428,8 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, b
 			evm.Cancel()
 		}()
 
-		// Execute the message
-		gp := new(core.GasPool).AddGas(MaxGasLimit)
+		// Execute the message with remaining gas limit
+		gp := new(core.GasPool).AddGas(remainingGasLimit)
 		ibs.SetTxContext(txHash, header.Hash(), i)
 
 		result, err := core.ApplyMessage(evm, core.Message(msg), gp, true, false)
@@ -529,7 +554,13 @@ func (api *APIImpl) TransactionPreExec(ctx context.Context, origins []PreArgs, b
 		}
 
 		preResList = append(preResList, preRes)
-		log.Info("TransactionPreExec execute finished", "requestID", requestID, "index", i, "gasUsed", gasUsed)
+
+		// Update cumulative gas usage for next transaction
+		cumulativeGasUsed += gasUsed
+
+		log.Info("TransactionPreExec execute finished", "requestID", requestID, "index", i,
+			"gasUsed", gasUsed, "cumulativeGasUsed", cumulativeGasUsed,
+			"remainingGas", blockGasLimit-cumulativeGasUsed)
 	}
 
 	return preResList, nil

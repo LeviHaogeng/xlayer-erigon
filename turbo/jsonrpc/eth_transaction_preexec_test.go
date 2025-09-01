@@ -24,6 +24,7 @@ import (
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rpc/rpccfg"
 	"github.com/ledgerwatch/erigon/turbo/adapter/ethapi"
+	"github.com/ledgerwatch/erigon/turbo/rpchelper"
 	"github.com/ledgerwatch/erigon/turbo/stages/mock"
 
 	_ "github.com/ledgerwatch/erigon/eth/tracers/native"
@@ -154,8 +155,15 @@ func setupTestEnvironment(t *testing.T) (*APIImpl, libcommon.Address) {
 	// Create mock environment
 	m := mock.MockWithGenesis(t, gspec, bankKey, false)
 
+	// Create ethconfig with block gas limit for testing
+	ethCfg := &ethconfig.Defaults
+	ethCfg.XLayer.DynamicBlockGasLimit = 2100000 // Set a default block gas limit for tests
+
 	// Create API using the same pattern as other tests
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, nil, 5000000, 1e18, 100_000, &ethconfig.Defaults, false, 100_000, 128, log.New(), nil, 100_000)
+	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, nil, 5000000, 1e18, 100_000, ethCfg, false, 100_000, 128, log.New(), nil, 100_000)
+
+	// Set up the block gas limit in cache for testing
+	rpchelper.SetCachedBlockGasLimit(2100000)
 
 	return api, bankAddress
 }
