@@ -158,6 +158,8 @@ const (
 	NoWhiteListedSender         DiscardReason = 128 // the transaction is sent by a non-whitelisted account
 )
 
+const logPrefix = "txpool"
+
 func (r DiscardReason) String() string {
 	switch r {
 	case NotSet:
@@ -343,6 +345,7 @@ type TxPool struct {
 	apolloCfg    ApolloConfig
 	gpCache      GPCache // GPCache will only work in sequencer node, without rpc node
 	freeGasAddrs map[string]bool
+	readContext  *readContext
 
 	// we cannot be in a flushing state whilst getting transactions from the pool, so we have this mutex which is
 	// exposed publicly so anything wanting to get "best" transactions can ensure a flush isn't happening and
@@ -423,6 +426,12 @@ func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, 
 		},
 		freeGasAddrs: map[string]bool{},
 	}
+
+	// For X Layer, Huge Tx Config
+	hugeTxConfig := new(ethconfig.HugeTxConfig)
+	*hugeTxConfig = ethCfg.DeprecatedTxPool.HugeTxConfig
+	tp.xlayerCfg.HugeTxConfig.Store(hugeTxConfig)
+
 	tp.setFreeGasList(ethCfg.DeprecatedTxPool.FreeGasList)
 
 	return tp, nil
@@ -720,15 +729,15 @@ func (p *TxPool) ResetYieldedStatus() {
 	}
 }
 
-func (p *TxPool) YieldBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
+func (p *TxPool) YieldBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
 	// For X Layer
-	return p.bestForXLayer(n, txs, tx, onTopOf, availableGas, availableBlobGas, toSkip)
+	return p.bestForXLayer(n, txs, tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas, toSkip)
 }
 
-func (p *TxPool) PeekBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas, availableBlobGas uint64) (bool, error) {
+func (p *TxPool) PeekBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas uint64) (bool, error) {
 	set := mapset.NewThreadUnsafeSet[[32]byte]()
 	// For X Layer
-	onTime, _, err := p.bestForXLayer(n, txs, tx, onTopOf, availableGas, availableBlobGas, set)
+	onTime, _, err := p.bestForXLayer(n, txs, tx, onTopOf, nextBlockNumber, availableGas, availableBlobGas, set)
 	return onTime, err
 }
 

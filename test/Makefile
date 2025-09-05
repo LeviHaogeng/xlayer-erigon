@@ -232,6 +232,38 @@ lint:
 	cd ../docs/endpoints && make check-doc
 	echo "Lint passed"
 
+.PHONY: test-hugetx-e2e
+test-hugetx-e2e: stop apollo
+	$(call set_seal_time,5s)
+	trap '$(STOP) git checkout -- $(HUGETX_CFG_FILE); rm -rf ./e2e/tmp' EXIT; MallocNanoZone=0 go test -tags hugetx -count=1 -failfast -race -v -p 1 -timeout 600s ./e2e/huge_tx_test.go
+	echo "HugeTx E2E tests passed"
+
+# helper to update huge-tx config in YAML (create keys if missing, then set values)
+HUGETX_CFG_FILE := config/apollo.seq.config.yaml
+
+.PHONY: set_seal_time
+define set_seal_time
+	@file=$(HUGETX_CFG_FILE); \
+	key="zkevm.sequencer-block-seal-time"; \
+	key2="zkevm.sequencer-max-block-seal-time"; \
+	key3="zkevm.sequencer-batch-seal-time"; \
+	val="$(1)"; \
+	num=$${val%[a-zA-Z]*}; \
+	unit=$${val#$$num}; \
+	max="$$(($$num*2))$$unit"; \
+	batch="$$(($$num*3))$$unit"; \
+	if grep -q "^$$key:" $$file; then :; else echo "$$key: \"$$val\"" >> $$file; fi; \
+	if grep -q "^$$key2:" $$file; then :; else echo "$$key2: \"$$max\"" >> $$file; fi; \
+	if grep -q "^$$key3:" $$file; then :; else echo "$$key3: \"$$batch\"" >> $$file; fi; \
+	sed -i.bak \
+		-e "s/^$$key:.*/$$key: \"$$val\"/" \
+		-e "s/^$$key2:.*/$$key2: \"$$max\"/" \
+		-e "s/^$$key3:.*/$$key3: \"$$batch\"/" $$file; \
+	rm -f $$file.bak; \
+	echo "Set $$key=$$val, $$key2=$$max, $$key3=$$batch in $$file"; \
+	tail -n 15 $$file
+endef
+
 .PHONY: test-e2e
 test-e2e: stop all ## Runs group xlayer feature e2e tests checking race conditions
 	sleep 3

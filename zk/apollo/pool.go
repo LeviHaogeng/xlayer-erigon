@@ -2,6 +2,7 @@ package apollo
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/apolloconfig/agollo/v4/storage"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
@@ -31,7 +32,7 @@ func (c *Client) firePool(ctx *cli.Context, value *storage.ConfigChange) {
 	log.Info(fmt.Sprintf("apollo pool config changed: %+v", value.NewValue.(string)))
 
 	// Set pool flag on fire configuration changes
-	setPoolFlag()
+	setPoolFlag(value)
 }
 
 // loadPoolConfig loads the dynamic pool apollo configurations
@@ -57,10 +58,11 @@ func loadEthPoolConfig(ctx *cli.Context, ethCfg *ethconfig.Config) {
 	utils.SetApolloPoolXLayer(ctx, ethCfg)
 }
 
-func setPoolFlag() {
+func setPoolFlag(value *storage.ConfigChange) {
 	UnsafeGetApolloConfig().Lock()
 	defer UnsafeGetApolloConfig().Unlock()
 	UnsafeGetApolloConfig().setPoolFlag()
+	parseHugeTxYieldEnabled(value.NewValue.(string))
 }
 
 // -------------------------- txpool config methods --------------------------
@@ -129,4 +131,16 @@ func (cfg *ApolloConfig) GetEnableFreeGasList(localEnableFreeGasList bool) bool 
 		return cfg.EthCfg.DeprecatedTxPool.EnableFreeGasList
 	}
 	return localEnableFreeGasList
+}
+
+func parseHugeTxYieldEnabled(configStr string) {
+	if strings.Contains(configStr, "hugeTxE2EYieldEnabled") {
+		if strings.Contains(configStr, "hugeTxE2EYieldEnabled: true") {
+			UnsafeGetApolloConfig().EthCfg.DeprecatedTxPool.HugeTxConfig.HugeTxE2EYieldEnabled = true
+			log.Info("HugeTxE2EYieldEnabled is set through Apollo config center", "value", true)
+		} else if strings.Contains(configStr, "hugeTxE2EYieldEnabled: false") {
+			UnsafeGetApolloConfig().EthCfg.DeprecatedTxPool.HugeTxConfig.HugeTxE2EYieldEnabled = false
+			log.Info("HugeTxE2EYieldEnabled is set through Apollo config center", "value", false)
+		}
+	}
 }
