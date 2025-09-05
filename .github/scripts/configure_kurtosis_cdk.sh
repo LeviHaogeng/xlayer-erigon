@@ -19,7 +19,7 @@ fi
 
 echo 'args:' > params.yml
 echo '  cdk_erigon_node_image: cdk-erigon:local' >> params.yml
-echo '  el-1-geth-lighthouse: ethpandaops/lighthouse@sha256:4902d9e4a6b6b8d4c136ea54f0e51582a32f356f3dec7194a1adee13ed2d662e' >> params.yml
+echo '  el-1-geth-lighthouse: sigp/lighthouse:v6.0.0' >> params.yml
 /usr/local/bin/yq -i '.args.data_availability_mode = "${{ matrix.da-mode }}"' params.yml
 sed -i 's/"londonBlock": [0-9]\+/"londonBlock": 0/' ./templates/cdk-erigon/chainspec.json
 sed -i 's/"normalcyBlock": [0-9]\+/"normalcyBlock": 0/' ./templates/cdk-erigon/chainspec.json
