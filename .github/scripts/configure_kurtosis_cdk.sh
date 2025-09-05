@@ -17,9 +17,17 @@ if [ "$1" = "ac-split" ]; then
   echo "zkevm.enable-async-commit: true" >> templates/cdk-erigon/config.yml
 fi
 
-echo 'args:' > params.yml
-echo '  cdk_erigon_node_image: cdk-erigon:local' >> params.yml
-echo '  el-1-geth-lighthouse: sigp/lighthouse:v6.0.0' >> params.yml
+cat > params.yml << 'EOF'
+args:
+  cdk_erigon_node_image: cdk-erigon:local
+  ethereum_package:
+    participants_matrix:
+      el:
+        - el_type: geth
+      cl:
+        - cl_type: lighthouse
+          cl_image: sigp/lighthouse:v6.0.0
+EOF
 /usr/local/bin/yq -i '.args.data_availability_mode = "${{ matrix.da-mode }}"' params.yml
 sed -i 's/"londonBlock": [0-9]\+/"londonBlock": 0/' ./templates/cdk-erigon/chainspec.json
 sed -i 's/"normalcyBlock": [0-9]\+/"normalcyBlock": 0/' ./templates/cdk-erigon/chainspec.json
