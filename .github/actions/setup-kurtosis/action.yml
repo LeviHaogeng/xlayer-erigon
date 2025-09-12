@@ -69,10 +69,16 @@ runs:
       working-directory: ./kurtosis-cdk
       shell: bash
       run: |
+        echo 'deployment_stages:' > params.yml
+          echo '  deploy_l2_contracts: true' >> params.yml
+          echo '  deploy_optimism_rollup: false' >> params.yml
+          echo '  deploy_op_succinct: false' >> params.yml
         echo 'args:' > params.yml
         echo '  consensus_contract_type: "pessimistic"' >> params.yml
         echo '  pp_vkey_hash: "0x00d6e4bdab9cac75a50d58262bb4e60b3107a6b61131ccdff649576c624b6fb7"' >> params.yml
         echo '  cdk_erigon_node_image: cdk-erigon:local' >> params.yml
+        echo '  agglayer_prover_primary_prover: mock-prover' >> params.yml
+        echo '  erigon_strict_mode: false' >> params.yml
         echo '  el-1-geth-lighthouse: ethpandaops/lighthouse@sha256:4902d9e4a6b6b8d4c136ea54f0e51582a32f356f3dec7194a1adee13ed2d662e' >> params.yml
         /usr/local/bin/yq -i '.args.data_availability_mode = "${{ matrix.da-mode }}"' params.yml
         sed -i 's/"londonBlock": [0-9]\+/"londonBlock": 0/' ./templates/cdk-erigon/chainspec.json
