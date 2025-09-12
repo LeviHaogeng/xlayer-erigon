@@ -73,7 +73,7 @@ runs:
           echo '  deploy_l2_contracts: true' >> params.yml
           echo '  deploy_optimism_rollup: false' >> params.yml
           echo '  deploy_op_succinct: false' >> params.yml
-        echo 'args:' > params.yml
+        echo 'args:' >> params.yml
         echo '  consensus_contract_type: "pessimistic"' >> params.yml
         echo '  pp_vkey_hash: "0x00d6e4bdab9cac75a50d58262bb4e60b3107a6b61131ccdff649576c624b6fb7"' >> params.yml
         echo '  cdk_erigon_node_image: cdk-erigon:local' >> params.yml
@@ -86,6 +86,15 @@ runs:
         sed -i 's/"shanghaiTime": [0-9]\+/"shanghaiTime": 0/' ./templates/cdk-erigon/chainspec.json
         sed -i 's/"cancunTime": [0-9]\+/"cancunTime": 0/' ./templates/cdk-erigon/chainspec.json
         sed -i '/"terminalTotalDifficulty"/d' ./templates/cdk-erigon/chainspec.json
+        echo "Kurtosis params file:"
+        cat params.yml
+
+    - name: Copy params.yml to cdk-erigon
+      working-directory: ./kurtosis-cdk
+      shell: bash
+      run: |
+        cp params.yml ../../cdk-erigon/params.yml
+
 
     - name: Teardown existing enclave
       shell: bash
