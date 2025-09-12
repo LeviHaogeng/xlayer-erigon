@@ -28,12 +28,16 @@ import (
 	"github.com/ledgerwatch/erigon/core/types/accounts"
 	"github.com/ledgerwatch/erigon/crypto"
 	"github.com/ledgerwatch/erigon/ethclient"
+	"github.com/ledgerwatch/erigon/rpc"
 	"github.com/ledgerwatch/erigon/test/operations"
+	"github.com/ledgerwatch/erigon/zk/realtime/realtimeapi"
 	"github.com/ledgerwatch/erigon/zk/realtime/rtclient"
 	zktypes "github.com/ledgerwatch/erigon/zk/types"
 	"github.com/ledgerwatch/erigon/zkevm/encoding"
 	"github.com/ledgerwatch/log/v3"
+	logger "github.com/ledgerwatch/log/v3"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestRealtimeRPC(t *testing.T) {
@@ -103,6 +107,14 @@ func TestRealtimeRPC(t *testing.T) {
 		includeExtraInfo := true
 		result, err := client.RealtimeGetTransactionByHash(common.HexToHash(txHash), &includeExtraInfo)
 		require.NoError(t, err)
+
+		receipt, err := client.RealtimeGetTransactionReceipt(common.HexToHash(txHash))
+		require.NoError(t, err)
+		require.NotNil(t, receipt, "GetTransactionReceipt should return receipt")
+
+		txHashIndex := int(*result.TransactionIndex)
+		receiptIndex := int(receipt.TransactionIndex)
+		require.Equal(t, receiptIndex, txHashIndex)
 		log.Info(fmt.Sprintf("RealtimeGetTransactionByHash result type: %T", result))
 	})
 
@@ -148,7 +160,7 @@ func TestRealtimeRPC(t *testing.T) {
 
 	t.Run("RealtimeGetStorageAt", func(t *testing.T) {
 		// 0x2 is refered to _totalSupply field
-		value, err := client.RealtimeGetStorageAt(erc20Address, "0x2")
+		value, err := client.RealtimeGetStorageAt(erc20Address, "0x2", "pending")
 		require.NoError(t, err)
 		require.Equal(t, "0x00000000000000000000000000000000000000000052b7d2dcc80cd2e4000000", value, "Storage at index 0x2 should be equal to 1000000000000000000000")
 		log.Info(fmt.Sprintf("RealtimeGetStorageAt result for erc20 contract %s at index %s: %s", erc20Address, "0x2", value))
@@ -188,6 +200,50 @@ func TestRealtimeRPC(t *testing.T) {
 		gasEstimateCall, err := client.RealtimeEstimateGas(contractCallArgs)
 		require.NoError(t, err)
 		require.Greater(t, gasEstimateCall, gasEstimate, "Contract call should require more gas than simple transfer")
+	})
+
+	// Test call for block height specific
+	t.Run("RealtimeCallWithHeight", func(t *testing.T) {
+		data, err := erc20ABI.Pack("balanceOf", fromAddress)
+		require.NoError(t, err)
+
+		startValue, err := client.RealtimeCall(testAddress, erc20Address, "0x100000", "0x1", "0x0", fmt.Sprintf("0x%x", data))
+		require.NoError(t, err)
+		require.Equal(t, "0x00000000000000000000000000000000000000000052b7d2dcc80cd2e4000000", startValue, fmt.Sprintf("Balance of %s should be equal to 1e+26", fromAddress))
+
+		// Send balance transfer
+		transferAmount := new(big.Int).Mul(big.NewInt(1), big.NewInt(1e18)) // Adjust for token decimals (18 in this case)
+		nonce, err := client.RealtimeGetTransactionCount(fromAddress)
+		require.NoError(t, err)
+		signedTx := erc20TransferTx(t, ctx, privateKey, client, transferAmount, testAddress, erc20Address, nonce)
+		err = WaitTxToBeMined(ctx, client, signedTx, DefaultTimeoutTxToBeMined)
+		require.NoError(t, err)
+
+		// Get tx block number
+		receipt, err := client.RealtimeGetTransactionReceipt(signedTx.Hash())
+		require.NoError(t, err)
+		require.NotNil(t, receipt)
+		targetBlockNumber := receipt.BlockNumber.Uint64()
+
+		correctValue, err := client.RealtimeCall(testAddress, erc20Address, "0x100000", "0x1", "0x0", fmt.Sprintf("0x%x", data))
+		require.NoError(t, err)
+		require.Equal(t, "0x00000000000000000000000000000000000000000052b7d2cee7561f3c9c0000", correctValue, fmt.Sprintf("Balance of %s should be equal to 9.9999999e+25 after transfer", fromAddress))
+		require.NotEqual(t, startValue, correctValue)
+
+		// Send balance transfer
+		signedTx = erc20TransferTx(t, ctx, privateKey, client, transferAmount, testAddress, erc20Address, nonce+1)
+		err = WaitTxToBeMined(ctx, client, signedTx, DefaultTimeoutTxToBeMined)
+		require.NoError(t, err)
+
+		endValue, err := client.RealtimeCall(testAddress, erc20Address, "0x100000", "0x1", "0x0", fmt.Sprintf("0x%x", data))
+		require.NoError(t, err)
+		require.NotEqual(t, endValue, correctValue)
+		require.Equal(t, "0x00000000000000000000000000000000000000000052b7d2c1069f6b95380000", endValue, fmt.Sprintf("Balance of %s should be equal to 9.9999998e+25 after transfer", fromAddress))
+
+		// Get block height specific state
+		testValue, err := client.EthGetTokenBalance(ctx, testAddress, erc20Address, new(big.Int).SetUint64(targetBlockNumber))
+		require.NoError(t, err)
+		require.NotEqual(t, testValue, correctValue)
 	})
 
 	t.Run("RealtimeGetBlockByNumber", func(t *testing.T) {
@@ -287,6 +343,37 @@ func TestRealtimeRPC(t *testing.T) {
 		log.Info(fmt.Sprintf("RealtimeGetBlockInternalTransactions successfully returned data for block %d", targetBlockNumber))
 	})
 
+	t.Run("RealtimeGetBlockReceipts", func(t *testing.T) {
+		numberOfTransactions := 10
+
+		// Create the specified number of transactions and wait for them to be mined
+		txHashes := transTokenBatch(t, context.Background(), client, uint256.NewInt(encoding.Gwei), testAddress.String(), numberOfTransactions)
+		lastTxHash := txHashes[len(txHashes)-1]
+
+		// Get the block information from the last transaction's receipt
+		receipt, err := client.RealtimeGetTransactionReceipt(common.HexToHash(lastTxHash))
+		require.NoError(t, err)
+		require.NotNil(t, receipt, "Transaction receipt should not be nil")
+
+		receiptsByNumber, err := client.RealtimeGetBlockReceiptsByNumber(receipt.BlockNumber.Uint64())
+		require.NoError(t, err)
+		require.NotNil(t, receiptsByNumber, "Transaction receipts by number should not be nil")
+		for _, receipt := range receiptsByNumber {
+			require.NoError(t, err)
+			require.NotNil(t, receipt)
+			log.Info(fmt.Sprintf("RealtimeGetBlockReceiptsByNumber result type: %T", receipt))
+		}
+
+		receiptsByHash, err := client.RealtimeGetBlockReceiptsByHash(receipt.BlockHash)
+		require.NoError(t, err)
+		require.NotNil(t, receiptsByHash, "Transaction receipts by hash should not be nil")
+		for _, receipt := range receiptsByHash {
+			require.NoError(t, err)
+			require.NotNil(t, receipt)
+			log.Info(fmt.Sprintf("RealtimeGetBlockReceiptsByHash result type: %T", receipt))
+		}
+	})
+
 	t.Run("RealtimeEnabled", func(t *testing.T) {
 		// Test with valid "pending" tag
 		isEnabled, err := client.RealtimeEnabled()
@@ -337,6 +424,63 @@ func TestRealtimeRPC(t *testing.T) {
 
 		require.Equal(t, block["hash"], blockByHash["hash"], "Block hashes should match")
 		require.Equal(t, block["number"], blockByHash["number"], "Block numbers should match")
+	})
+
+	t.Run("RealtimeSubscriptionWorking", func(t *testing.T) {
+		var iterations = 11
+		latestBlockNum, err := client.RealtimeBlockNumber()
+		require.NoError(t, err)
+		require.Greater(t, latestBlockNum, uint64(0), "Latest block number should be greater than 0")
+
+		logger := logger.New()
+		wsClient, err := rpc.Dial(DefaultL2NetworkWSURL, logger)
+		require.NoError(t, err)
+
+		realtimeMsgCh := make(chan realtimeapi.RealtimeSubResult)
+		realtimeSub, err := wsClient.Subscribe(ctx, "eth", realtimeMsgCh, "realtime", map[string]bool{"NewHeads": false, "TransactionExtraInfo": true, "TransactionReceipt": true, "TransactionInnerTxs": true})
+		require.NoError(t, err)
+		defer realtimeSub.Unsubscribe()
+
+		for i := 0; i < iterations; i++ {
+			// Send tx
+			signedTx := nativeTransferTx(t, ctx, client, uint256.NewInt(encoding.Gwei), testAddress.String())
+			g, _ := errgroup.WithContext(ctx)
+
+			// realtime subscription
+			g.Go(func() error {
+
+				for {
+					select {
+					case msg := <-realtimeMsgCh:
+						// BlockTime should always be returned
+						if msg.BlockTime == 0 {
+							return fmt.Errorf("block time is 0 and not sent")
+						}
+						// Since we set the TransactionExtraInfo, TransactionReceipt, and TransactionInnerTxs to true, these fields should not be nil
+						if msg.TxData == nil {
+							return fmt.Errorf("tx data is nil")
+						}
+						if msg.Receipt == nil {
+							return fmt.Errorf("receipt is nil")
+						}
+						if msg.InnerTxs == nil {
+							return fmt.Errorf("inner transactions is nil")
+						}
+						if msg.TxHash == signedTx.Hash().String() {
+							return nil
+						}
+					case err := <-realtimeSub.Err():
+						return err
+					case <-time.After(DefaultTimeoutTxToBeMined):
+						return fmt.Errorf("realtime subscription timeout")
+					}
+				}
+			})
+
+			// Wait for all goroutines to complete
+			err = g.Wait()
+			require.NoError(t, err)
+		}
 	})
 }
 
