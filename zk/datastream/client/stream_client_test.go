@@ -195,8 +195,7 @@ func TestStreamClientReadFileEntry(t *testing.T) {
 			defer server.Close()
 			defer c.Stop()
 
-		c.conn = conn
-		t.Run(testCase.name, func(t *testing.T) {
+			c.conn = conn
 			go func() {
 				server.Write(testCase.input)
 			}()
