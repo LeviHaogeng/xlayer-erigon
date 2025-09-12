@@ -16,7 +16,8 @@ runs:
         path: kurtosis-cdk
 
     - name: Install Kurtosis CDK tools
-      uses: ./kurtosis-cdk/.github/actions/setup-kurtosis-cdk
+      if: env.SKIP_ENCLAVE_SETUP != 'true'
+      uses: ./kurtosis-cdk/.github/actions/kurtosis-pre-run
 
     - name: Install Foundry
       uses: foundry-rs/foundry-toolchain@v1
@@ -79,6 +80,12 @@ runs:
         sed -i 's/"shanghaiTime": [0-9]\+/"shanghaiTime": 0/' ./templates/cdk-erigon/chainspec.json
         sed -i 's/"cancunTime": [0-9]\+/"cancunTime": 0/' ./templates/cdk-erigon/chainspec.json
         sed -i '/"terminalTotalDifficulty"/d' ./templates/cdk-erigon/chainspec.json
+
+    - name: Teardown existing enclave
+      shell: bash
+      run: |
+        kurtosis enclave stop cdk-v1 || true
+        kurtosis enclave rm   cdk-v1 || true
 
     - name: Deploy Kurtosis CDK package
       working-directory: ./kurtosis-cdk
