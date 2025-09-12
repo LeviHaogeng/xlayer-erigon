@@ -89,13 +89,6 @@ runs:
         echo "Kurtosis params file:"
         cat params.yml
 
-    - name: Copy params.yml to cdk-erigon
-      working-directory: ./kurtosis-cdk
-      shell: bash
-      run: |
-        cp params.yml ../../cdk-erigon/params.yml
-
-
     - name: Teardown existing enclave
       shell: bash
       run: |
