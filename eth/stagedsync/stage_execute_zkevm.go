@@ -118,6 +118,9 @@ Loop:
 			log.Info(fmt.Sprintf("[%s] Sync limit reached", s.LogPrefix()), "block", blockNum)
 			break
 		}
+		if blockNum&0xff == 0 {
+			log.Info("executing block", "block", blockNum)
+		}
 
 		if stoppedErr = common.Stopped(quit); stoppedErr != nil {
 			break
@@ -305,6 +308,14 @@ func getExecRange(cfg ExecuteBlockCfg, tx kv.RwTx, stageProgress, toBlock uint64
 	// if shouldShortCircuit {
 	// 	to = noProgressTo
 	// }
+
+	// For X Layer: Apply LoopBlockLimit to restrict maximum execution range per iteration
+	if cfg.syncCfg.LoopBlockLimit > 0 {
+		maxTo := stageProgress + uint64(cfg.syncCfg.LoopBlockLimit)
+		if to > maxTo {
+			to = maxTo
+		}
+	}
 
 	total := to - stageProgress
 

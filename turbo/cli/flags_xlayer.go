@@ -21,6 +21,7 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
+const MinLoopBlockLimit uint = 100000
 const EnvKafkaConsumerGroupID = "REALTIME_KAFKA_CONSUMER_GROUP_ID"
 
 func ApplyFlagsForEthXLayerConfig(ctx *cli.Context, cfg *ethconfig.Config) {

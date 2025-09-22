@@ -295,6 +295,9 @@ func capFinalizedBatchToLocal(sequencerBatchNum uint64, db kv.RoDB) uint64 {
 		log.Error("Failed to get latest block number", "err", err)
 		return sequencerBatchNum
 	}
+	if localLatestBlockNum == 0 {
+		return sequencerBatchNum
+	}
 
 	hermezDb := hermez_db.NewHermezDbReader(tx)
 	localBatchNum, err := hermezDb.GetBatchNoByL2Block(localLatestBlockNum)
@@ -302,8 +305,6 @@ func capFinalizedBatchToLocal(sequencerBatchNum uint64, db kv.RoDB) uint64 {
 		log.Error("Failed to get batch by block number", "err", err)
 		return sequencerBatchNum
 	}
-	log.Info("Get and update finalized batch number", "sequencerBatchNum", sequencerBatchNum,
-		"localBatchNum", localBatchNum, "localLatestBlockNum", localLatestBlockNum)
 
 	return cmp.Min(localBatchNum, sequencerBatchNum)
 }

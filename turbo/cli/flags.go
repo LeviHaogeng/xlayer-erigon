@@ -319,7 +319,13 @@ func ApplyFlagsForEthConfig(ctx *cli.Context, cfg *ethconfig.Config, logger log.
 	}
 
 	if limit := ctx.Uint(SyncLoopBlockLimitFlag.Name); limit > 0 {
-		cfg.Sync.LoopBlockLimit = limit
+		// For X Layer
+		if limit < MinLoopBlockLimit {
+			logger.Warn("LoopBlockLimit is less than the minimum enforced value", "limit", limit, "minimum", MinLoopBlockLimit)
+		} else {
+			logger.Info("LoopBlockLimit is set", "limit", limit)
+			cfg.Sync.LoopBlockLimit = limit
+		}
 	}
 
 	if location := ctx.String(UploadLocationFlag.Name); len(location) > 0 {
