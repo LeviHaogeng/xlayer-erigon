@@ -35,7 +35,6 @@ import (
 	zktypes "github.com/ledgerwatch/erigon/zk/types"
 	"github.com/ledgerwatch/erigon/zkevm/encoding"
 	"github.com/ledgerwatch/log/v3"
-	logger "github.com/ledgerwatch/log/v3"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -439,7 +438,7 @@ func TestRealtimeRPC(t *testing.T) {
 		require.NoError(t, err)
 		require.Greater(t, latestBlockNum, uint64(0), "Latest block number should be greater than 0")
 
-		logger := logger.New()
+		logger := log.New()
 		wsClient, err := rpc.Dial(DefaultL2NetworkWSURL, logger)
 		require.NoError(t, err)
 
@@ -579,108 +578,189 @@ func compareCacheWithSequenceDB(t *testing.T, dbDir, cacheDir string) {
 		cacheFiles[fileName] = string(data)
 	}
 
+	maxAttempts := 5
+	retryDelay := 1 * time.Second
+
+	var err error
+
+	for attempts := 0; attempts < maxAttempts; attempts++ {
+		err = performCacheComparison(dbDir, cacheFiles)
+
+		if err == nil {
+			return
+		}
+
+		time.Sleep(retryDelay)
+	}
+
+	require.NoError(t, err, "Cache comparison failed after %d attempts", maxAttempts)
+}
+
+func performCacheComparison(dbDir string, cacheFiles map[string]string) error {
 	tempDbDir, err := ioutil.TempDir("", "mdbx_copy")
-	require.NoError(t, err, "Failed to create temp db dir")
+	if err != nil {
+		return fmt.Errorf("failed to create temp db dir: %v", err)
+	}
 	defer os.RemoveAll(tempDbDir)
 
+	// Copy database
 	cmd := exec.Command("cp", "-r", dbDir, tempDbDir)
 	output, err := cmd.CombinedOutput()
-	require.NoError(t, err, "Failed to copy db dir with cp -r: %s, output: %s", dbDir, string(output))
+	if err != nil {
+		return fmt.Errorf("failed to copy db dir: %v, output: %s", err, string(output))
+	}
 	copiedDbDir := filepath.Join(tempDbDir, filepath.Base(dbDir))
 
 	ctx := context.Background()
 	db, err := mdbx.NewMDBX(log.New()).Path(copiedDbDir).Open(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %v", err)
+	}
 	defer db.Close()
 
 	// Compare account data
 	if cacheFiles["account_cache.json"] != "" {
 		var accountCache map[string]string
-		err := json.Unmarshal([]byte(cacheFiles["account_cache.json"]), &accountCache)
-		require.NoError(t, err)
+		if err := json.Unmarshal([]byte(cacheFiles["account_cache.json"]), &accountCache); err != nil {
+			return fmt.Errorf("failed to unmarshal account cache: %v", err)
+		}
 
-		db.View(ctx, func(txn kv.Tx) error {
+		if err := db.View(ctx, func(txn kv.Tx) error {
 			for k, v := range accountCache {
 				key, err := hex.DecodeString(k)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode account key %s: %v", k, err)
+				}
 				value, err := txn.GetOne(kv.PlainState, key)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to read account %s from database: %v", k, err)
+				}
 
 				vBytes, _ := hex.DecodeString(v)
 				var dbAccount accounts.Account
 				err = dbAccount.DecodeForStorage(value)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode account %s from database: %v", k, err)
+				}
 
 				var cacheAccount accounts.Account
 				err = cacheAccount.DecodeForStorage(vBytes)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode account %s from cache: %v", k, err)
+				}
 
-				require.Equal(t, cacheAccount.Initialised, dbAccount.Initialised, "Initialised mismatch for account %s, from cache: %t, from db: %t", k, cacheAccount.Initialised, dbAccount.Initialised)
-				require.Equal(t, cacheAccount.Nonce, dbAccount.Nonce, "Nonce mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.Nonce, dbAccount.Nonce)
-				require.Equal(t, cacheAccount.Balance, dbAccount.Balance, "Balance mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.Balance.String(), dbAccount.Balance.String())
-				require.Equal(t, cacheAccount.Root, dbAccount.Root, "Root mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.Root.Hex(), dbAccount.Root.Hex())
-				require.Equal(t, cacheAccount.CodeHash, dbAccount.CodeHash, "CodeHash mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.CodeHash.Hex(), dbAccount.CodeHash.Hex())
-				require.Equal(t, cacheAccount.Incarnation, dbAccount.Incarnation, "Incarnation mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.Incarnation, dbAccount.Incarnation)
-				require.Equal(t, cacheAccount.PrevIncarnation, dbAccount.PrevIncarnation, "PrevIncarnation mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.PrevIncarnation, dbAccount.PrevIncarnation)
+				// Check all account fields for mismatches
+				if cacheAccount.Initialised != dbAccount.Initialised {
+					return fmt.Errorf("initialised mismatch for account %s, from cache: %t, from db: %t", k, cacheAccount.Initialised, dbAccount.Initialised)
+				}
+				if cacheAccount.Nonce != dbAccount.Nonce {
+					return fmt.Errorf("nonce mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.Nonce, dbAccount.Nonce)
+				}
+				if cacheAccount.Balance != dbAccount.Balance {
+					return fmt.Errorf("balance mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.Balance.String(), dbAccount.Balance.String())
+				}
+				if cacheAccount.Root != dbAccount.Root {
+					return fmt.Errorf("root mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.Root.Hex(), dbAccount.Root.Hex())
+				}
+				if cacheAccount.CodeHash != dbAccount.CodeHash {
+					return fmt.Errorf("codeHash mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.CodeHash.Hex(), dbAccount.CodeHash.Hex())
+				}
+				if cacheAccount.Incarnation != dbAccount.Incarnation {
+					return fmt.Errorf("incarnation mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.Incarnation, dbAccount.Incarnation)
+				}
+				if cacheAccount.PrevIncarnation != dbAccount.PrevIncarnation {
+					return fmt.Errorf("prevIncarnation mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.PrevIncarnation, dbAccount.PrevIncarnation)
+				}
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	// Compare storage data
 	if cacheFiles["storage_cache.json"] != "" {
 		var storageCache map[string]string
-		err := json.Unmarshal([]byte(cacheFiles["storage_cache.json"]), &storageCache)
-		require.NoError(t, err)
+		if err := json.Unmarshal([]byte(cacheFiles["storage_cache.json"]), &storageCache); err != nil {
+			return fmt.Errorf("failed to unmarshal storage cache: %v", err)
+		}
 
-		db.View(ctx, func(txn kv.Tx) error {
+		if err := db.View(ctx, func(txn kv.Tx) error {
 			for k, v := range storageCache {
 				key, err := hex.DecodeString(k)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode storage key %s: %v", k, err)
+				}
 				value, err := txn.GetOne(kv.PlainState, key)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to read storage %s from database: %v", k, err)
+				}
 
-				require.Equal(t, v, hex.EncodeToString(value), "Storage mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				if v != hex.EncodeToString(value) {
+					return fmt.Errorf("storage mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				}
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	// Compare code data
 	if cacheFiles["code_cache.json"] != "" {
 		var codeCache map[string]string
-		err := json.Unmarshal([]byte(cacheFiles["code_cache.json"]), &codeCache)
-		require.NoError(t, err)
+		if err := json.Unmarshal([]byte(cacheFiles["code_cache.json"]), &codeCache); err != nil {
+			return fmt.Errorf("failed to unmarshal code cache: %v", err)
+		}
 
-		db.View(ctx, func(txn kv.Tx) error {
+		if err := db.View(ctx, func(txn kv.Tx) error {
 			for k, v := range codeCache {
 				key, err := hex.DecodeString(k)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode code key %s: %v", k, err)
+				}
 				value, err := txn.GetOne(kv.Code, key)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to read code %s from database: %v", k, err)
+				}
 
-				require.Equal(t, v, hex.EncodeToString(value), "Code mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				if v != hex.EncodeToString(value) {
+					return fmt.Errorf("code mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				}
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	// Compare incarnation data
 	if cacheFiles["incarnation_cache.json"] != "" {
 		var incarnationCache map[string]string
-		err := json.Unmarshal([]byte(cacheFiles["incarnation_cache.json"]), &incarnationCache)
-		require.NoError(t, err)
+		if err := json.Unmarshal([]byte(cacheFiles["incarnation_cache.json"]), &incarnationCache); err != nil {
+			return fmt.Errorf("failed to unmarshal incarnation cache: %v", err)
+		}
 
-		db.View(ctx, func(txn kv.Tx) error {
+		if err := db.View(ctx, func(txn kv.Tx) error {
 			for k, v := range incarnationCache {
 				key, err := hex.DecodeString(k)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode incarnation key %s: %v", k, err)
+				}
 				value, err := txn.GetOne(kv.Code, key)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to read incarnation %s from database: %v", k, err)
+				}
 
-				require.Equal(t, v, hex.EncodeToString(value), "Incarnation mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				if v != hex.EncodeToString(value) {
+					return fmt.Errorf("incarnation mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				}
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 	}
+
+	return nil
 }

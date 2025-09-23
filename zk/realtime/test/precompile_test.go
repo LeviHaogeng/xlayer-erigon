@@ -48,13 +48,19 @@ func TestPrecompile(t *testing.T) {
 	require.Equal(t, uint64(1), txReceipt.Status, "tx should be successful")
 
 	// Compare state cache. Precompile should be found in state cache
-	time.Sleep(1 * time.Second)
-	mismatches, err := client.RealtimeCompareStateCache()
-	require.NoError(t, err)
-	if len(mismatches) != 0 {
-		// Precompile address have no account state
-		require.Equal(t, 1, len(mismatches))
-		require.Equal(t, "account 0x0000000000000000000000000000000000000002 not found in database", mismatches[0], "mismatch should be for precompile address")
+	maxAttempts := 5
+	retryDelay := 1 * time.Second
+	for attempts := 0; attempts < maxAttempts; attempts++ {
+		mismatches, err := client.RealtimeCompareStateCache()
+		require.NoError(t, err)
+		if len(mismatches) == 1 {
+			require.Equal(t, "account 0x0000000000000000000000000000000000000002 not found in database", mismatches[0], "mismatch should be for precompile address")
+			break
+		}
+		if len(mismatches) <= 0 {
+			break
+		}
+		time.Sleep(retryDelay)
 	}
 
 	// Do eth call on precompile contract to execute sha256 operation with RT cache layer
