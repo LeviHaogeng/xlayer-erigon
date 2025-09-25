@@ -28,6 +28,7 @@ func TestPrecompile(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	time.Sleep(1 * time.Second)
 	ec, err := ethclient.Dial(DefaultL2NetworkRealtimeURL)
 	require.NoError(t, err)
 	client := rtclient.NewRealtimeClient(ec, DefaultL2NetworkRealtimeURL)

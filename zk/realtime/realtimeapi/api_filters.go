@@ -2,6 +2,7 @@ package realtimeapi
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon/common/debug"
@@ -42,32 +43,47 @@ func (api *RealtimeAPIImpl) Realtime(ctx context.Context, criteria realtimeSub.S
 			select {
 			case msg, ok := <-msgChan:
 				if !ok {
-					log.Warn("[realtime subscription] realtime txMsg channel closed")
+					log.Warn("[Realtime] subscription txMsg channel closed")
 					return
 				}
 
 				result := RealtimeSubResult{}
-				sendFlag := false
 				if criteria.NewHeads && msg.BlockMsg != nil {
-					// Send the latest confirmed block header
 					if err != nil || msg.BlockMsg.Header == nil {
-						log.Warn("[realtime subscription] error getting block info", "err", err)
+						log.Warn(fmt.Sprintf("[Realtime] subscription error: getting block info, err: %v", err))
+						continue
 					}
 					result.Header = msg.BlockMsg.Header
 					result.BlockTime = msg.BlockMsg.Header.Time
-					sendFlag = true
 				}
-
 				if msg.TxMsg != nil {
 					_, tx, receipt, innerTxs, err := msg.TxMsg.GetAllTxData()
 					if err != nil {
-						log.Warn("[realtime subscription] error getting tx data", "err", err)
+						log.Warn(fmt.Sprintf("[Realtime] subscription error: getting tx data, err: %v", err))
+						continue
 					}
+
+					txSender, ok := tx.GetSender()
+					if !ok {
+						log.Warn(fmt.Sprintf("[Realtime] subscription error: getting tx sender, err: %v", err))
+						continue
+					}
+					toAddress := tx.GetTo()
+					if len(criteria.SubscribedAddresses) != 0 {
+						found := false
+						for _, addr := range criteria.SubscribedAddresses {
+							if addr == txSender || addr == *toAddress {
+								found = true
+								break
+							}
+						}
+						if !found {
+							continue
+						}
+					}
+
 					result.TxHash = tx.Hash().Hex()
 					result.BlockTime = msg.TxMsg.BlockTime
-					sendFlag = true
-
-					// Add tx data according to stream criteria
 					if criteria.TransactionExtraInfo {
 						result.TxData = tx
 					}
@@ -78,12 +94,9 @@ func (api *RealtimeAPIImpl) Realtime(ctx context.Context, criteria realtimeSub.S
 						result.InnerTxs = innerTxs
 					}
 				}
-
-				if sendFlag {
-					err = notifier.Notify(rpcSub.ID, result)
-					if err != nil {
-						log.Warn("[realtime subscription] error while notifying subscription", "err", err)
-					}
+				err = notifier.Notify(rpcSub.ID, result)
+				if err != nil {
+					log.Warn(fmt.Sprintf("[Realtime] subscription error while notifying, err: %v", err))
 				}
 			case <-rpcSub.Err():
 				return
@@ -128,11 +141,11 @@ func (api *RealtimeAPIImpl) Logs(ctx context.Context, crit filters.FilterCriteri
 					}
 					err := notifier.Notify(rpcSub.ID, h)
 					if err != nil {
-						log.Warn("[realtime rpc] error while notifying subscription", "err", err)
+						log.Warn(fmt.Sprintf("[Realtime] subscription error while notifying, err: %v", err))
 					}
 				}
 				if !ok {
-					log.Warn("[realtime rpc] realtime log channel was closed")
+					log.Warn("[Realtime] realtime log channel was closed")
 					return
 				}
 			case <-rpcSub.Err():

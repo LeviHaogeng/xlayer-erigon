@@ -10,6 +10,7 @@ import (
 	"github.com/ledgerwatch/erigon/core/state"
 	"github.com/ledgerwatch/erigon/zk/metrics"
 	kafkaTypes "github.com/ledgerwatch/erigon/zk/realtime/kafka/types"
+	realtimeSub "github.com/ledgerwatch/erigon/zk/realtime/subscription"
 	realtimeTypes "github.com/ledgerwatch/erigon/zk/realtime/types"
 	"github.com/ledgerwatch/erigon/zk/utils"
 	"github.com/ledgerwatch/log/v3"
@@ -47,6 +48,8 @@ type PendingBlockContext struct {
 	pendingTxs *realtimeTypes.OrderedList[*kafkaTypes.TransactionMessage]
 	// pendingStateCache is the pending state cache for the current pending block
 	blockStateCache *BlockStateCache
+	// confirmBlockMsg is the confirmed block message for the current pending block
+	confirmBlockMsg *realtimeTypes.BlockInfo
 }
 
 // String returns a formatted string representation of the PendingBlockContext
@@ -97,9 +100,12 @@ type RealtimeCache struct {
 
 	// Pending blocks list
 	pendingBlocks *realtimeTypes.OrderedList[*PendingBlockContext]
+
+	// Subscription service
+	subService *realtimeSub.RealtimeSubscription
 }
 
-func NewRealtimeCache(ctx context.Context, db kv.RoDB, tx kv.Tx, chainName string, cacheDumpPath string, heightThreshold uint64) (*RealtimeCache, error) {
+func NewRealtimeCache(ctx context.Context, db kv.RoDB, tx kv.Tx, subService *realtimeSub.RealtimeSubscription, chainName string, cacheDumpPath string, heightThreshold uint64) (*RealtimeCache, error) {
 	return &RealtimeCache{
 		ctx:                    ctx,
 		db:                     db,
@@ -113,6 +119,7 @@ func NewRealtimeCache(ctx context.Context, db kv.RoDB, tx kv.Tx, chainName strin
 		highestExecutionHeight: atomic.Uint64{},
 		highestPendingHeight:   atomic.Uint64{},
 		pendingBlocks:          NewPendingBlockContextList(DefaultPendingBlockSize),
+		subService:             subService,
 	}, nil
 }
 
@@ -217,6 +224,7 @@ func (cache *RealtimeCache) TryCloseBlockFromConfirmedBlockMsg(blockNum uint64, 
 	// Update pending block context
 	pendingContext.txCount = blockMsg.TxCount
 	pendingContext.endBlockChangeset = blockMsg.Changeset
+	pendingContext.confirmBlockMsg = blockMsg
 	return cache.tryCloseBlock(pendingContext)
 }
 
@@ -282,6 +290,11 @@ func (cache *RealtimeCache) tryApplyBlockTxMsgs(blockContext *PendingBlockContex
 		blockContext.blockStateCache.ApplyChangeset(txMsg.Changeset, txMsg.BlockNumber)
 		blockContext.nextTxIndex++
 		processed++
+
+		if cache.subService != nil {
+			// Publish tx to subscriptions
+			cache.subService.BroadcastNewMsg(nil, txMsg)
+		}
 	}
 
 	newPendingTxs := blockContext.pendingTxs.Items()[processed:]
@@ -403,6 +416,11 @@ func (cache *RealtimeCache) tryCloseBlock(pendingBlockContext *PendingBlockConte
 
 	cache.PutHighestConfirmHeight(pendingBlockContext.blockNum)
 	log.Info(fmt.Sprintf("[Realtime] Closed block %d, pending blocks queue size: %d", pendingBlockContext.blockNum, cache.pendingBlocks.Size()))
+
+	if cache.subService != nil {
+		// Publish block to subscription
+		cache.subService.BroadcastNewMsg(pendingBlockContext.confirmBlockMsg, nil)
+	}
 
 	header, _, blockHash, ok := cache.Stateless.GetBlockInfo(pendingBlockContext.blockNum)
 	if !ok { // Should never happen

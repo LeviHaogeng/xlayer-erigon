@@ -10,7 +10,6 @@ import (
 	"github.com/ledgerwatch/erigon/zk/realtime/cache"
 	"github.com/ledgerwatch/erigon/zk/realtime/kafka"
 	kafkaTypes "github.com/ledgerwatch/erigon/zk/realtime/kafka/types"
-	realtimeSub "github.com/ledgerwatch/erigon/zk/realtime/subscription"
 	realtimeTypes "github.com/ledgerwatch/erigon/zk/realtime/types"
 	"github.com/ledgerwatch/erigon/zk/sequencer"
 	"github.com/ledgerwatch/log/v3"
@@ -75,8 +74,7 @@ func ListenKafkaConsumer(
 	ctx context.Context,
 	kafkaConsumer *kafka.KafkaConsumer,
 	realtimeCache *cache.RealtimeCache,
-	finishChan chan realtimeTypes.FinishedEntry,
-	subService *realtimeSub.RealtimeSubscription) {
+	finishChan chan realtimeTypes.FinishedEntry) {
 	if sequencer.IsSequencer() {
 		log.Info("[Realtime] KafkaConsumer is disabled on sequencer, skipping")
 		return
@@ -126,10 +124,6 @@ func ListenKafkaConsumer(
 			if blockMsg.IsConfirmedBlock() {
 				// Confirmed block msg
 				kafkaCache.ConfirmedBlockMsgCache.Add(&blockMsg)
-				if subService != nil {
-					// Publish block to subscriptions
-					subService.BroadcastNewMsg(&blockMsg, nil)
-				}
 				log.Debug(fmt.Sprintf("[Realtime] Received confirmed block message. blockNum: %d", blockMsg.Header.Number))
 			} else {
 				// New pending block msg
@@ -147,10 +141,6 @@ func ListenKafkaConsumer(
 				continue
 			}
 			kafkaCache.TxMsgCache.Add(&txMsg)
-			if subService != nil {
-				// Publish tx to subscriptions
-				subService.BroadcastNewMsg(nil, &txMsg)
-			}
 			log.Debug(fmt.Sprintf("[Realtime] Received transaction message. blockNum: %d, txHash: %x", txMsg.BlockNumber, txMsg.Hash))
 		case errorTriggerMsg := <-errorMsgsChan:
 			resetFlag.Store(true)

@@ -123,6 +123,7 @@ func (cache *BlockStateCache) ApplyChangeset(changeset *realtimeTypes.Changeset,
 
 	// Apply deleted accounts changes
 	for address := range changeset.DeletedAccounts {
+		cache.cache.deletedAccountsCache[address] = struct{}{}
 		// Non-existent / deleted accounts are set to nil
 		addressChanges[address] = nil
 	}
@@ -255,7 +256,10 @@ func (cache *BlockStateCache) ReadAccountData(address libcommon.Address) (*accou
 		accCopy := accounts.DeepCopyAccount(acc)
 		return accCopy, nil
 	}
-
+	// Check if the account is deleted
+	if _, ok := cache.cache.deletedAccountsCache[address]; ok {
+		return nil, nil
+	}
 	// Cache miss
 	if cache.prevCache == nil {
 		tx, err := cache.db.BeginRo(cache.ctx)
@@ -282,7 +286,10 @@ func (cache *BlockStateCache) ReadAccountStorage(address libcommon.Address, inca
 		storageCopy := libcommon.Copy(storage.Bytes())
 		return storageCopy, nil
 	}
-
+	// Check if the account is deleted
+	if _, ok := cache.cache.deletedAccountsCache[address]; ok {
+		return nil, nil
+	}
 	// Cache miss
 	if cache.prevCache == nil {
 		tx, err := cache.db.BeginRo(cache.ctx)
@@ -311,7 +318,10 @@ func (cache *BlockStateCache) ReadAccountCode(address libcommon.Address, incarna
 		codeCopy := libcommon.Copy(code)
 		return codeCopy, nil
 	}
-
+	// Check if the account is deleted
+	if _, ok := cache.cache.deletedAccountsCache[address]; ok {
+		return nil, nil
+	}
 	// Cache miss
 	if cache.prevCache == nil {
 		tx, err := cache.db.BeginRo(cache.ctx)
@@ -341,7 +351,6 @@ func (cache *BlockStateCache) ReadAccountIncarnation(address libcommon.Address) 
 	if ok {
 		return incarnation, nil
 	}
-
 	// Cache miss
 	if cache.prevCache == nil {
 		tx, err := cache.db.BeginRo(cache.ctx)

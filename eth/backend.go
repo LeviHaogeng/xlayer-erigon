@@ -1313,15 +1313,15 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 				} else {
 					backend.kafkaEnabled = true
 					backend.kafkaConsumer = kafkaConsumer
-					backend.realtimeCache, err = realtimeCache.NewRealtimeCache(backend.sentryCtx, backend.chainDB, tx, chainConfig.ChainName, cfg.Zk.XLayer.Realtime.CacheDumpPath, cfg.Zk.XLayer.Realtime.CacheHeightThreshold)
-					if err != nil {
-						backend.kafkaEnabled = false
-						log.Warn("[Realtime] Failed to initialize realtime cache", "error", err)
-					}
 					backend.finishChan = make(chan realtimeTypes.FinishedEntry)
 					if cfg.Zk.XLayer.Realtime.EnableSubscribe {
 						backend.realtimeSub = realtimeSub.NewRealtimeSubscription()
 						backend.realtimeSub.Start(ctx)
+					}
+					backend.realtimeCache, err = realtimeCache.NewRealtimeCache(backend.sentryCtx, backend.chainDB, tx, backend.realtimeSub, chainConfig.ChainName, cfg.Zk.XLayer.Realtime.CacheDumpPath, cfg.Zk.XLayer.Realtime.CacheHeightThreshold)
+					if err != nil {
+						backend.kafkaEnabled = false
+						log.Warn("[Realtime] Failed to initialize realtime cache", "error", err)
 					}
 				}
 			}
@@ -2123,7 +2123,7 @@ func (s *Ethereum) Start() error {
 
 		// For X Layer, realtime
 		if s.config.Zk.XLayer.Realtime.Enable && s.kafkaEnabled {
-			go realtime.ListenKafkaConsumer(s.sentryCtx, s.kafkaConsumer, s.realtimeCache, s.finishChan, s.realtimeSub)
+			go realtime.ListenKafkaConsumer(s.sentryCtx, s.kafkaConsumer, s.realtimeCache, s.finishChan)
 			go realtime.ListenKafkaProducer(s.sentryCtx, s.kafkaProducer, s.kafkaBlockInfoChan, s.kafkaTxInfoChan)
 		}
 	}
