@@ -123,7 +123,7 @@ func getBlockNumberFromCachedFinalizedBatchNumber(tx kv.Tx) (uint64, error) {
 		return 0, fmt.Errorf("failed to get highest block in batch %d: %w", batchNumber, err)
 	}
 	if !found {
-		log.Warn("No blocks found in finalized batch, returning 0", "batchNumber", batchNumber)
+		log.Debug("No blocks found in finalized batch, returning 0", "batchNumber", batchNumber)
 		return 0, fmt.Errorf("no blocks found in finalized batch, batchNumber=%d", batchNumber)
 	}
 
