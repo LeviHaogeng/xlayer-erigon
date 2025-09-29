@@ -1,15 +1,15 @@
 #!/bin/sh
 
-# Read the URL from the environment variable. If it is not set, use the default value
 URL="${XMONITOR_DBS2_URL:-http://okx-defi-xlayer-xmonitor-pro:7001/api/v1/dbs2}"
 
-# Read the URL from the environment variable. If it is not set, use the default value
-WORK_DIR="${XMONITOR_S2FILE_DIR:-/datax/erigon-data/chaindata}"
+MDB_FILE="${XMONITOR_S2FILE_DIR:-/data/erigon-data/chaindata/mdbx.dat}"
 
-echo "[$(date)] Configuration information: URL=$URL, WORK_DIR=$WORK_DIR"
+echo "[$(date)] config informations: URL=$URL, MDB_FILE=$MDB_FILE"
 
-cd "$WORK_DIR" || exit
-
+if [ ! -f "$MDB_FILE" ]; then
+    echo "[$(date)] err: file not have: $MDB_FILE"
+    exit 1
+fi
 
 MACHINE_ID="$(hostname)_$(head -c 32 /dev/urandom | md5sum | cut -c1-8)"
 
@@ -17,7 +17,7 @@ while true; do
   NOW=$(date +%H:%M)
   if [ "$NOW" == "11:58" ]; then
 
-      RAW_SIZE=$(du -sh mdb.dat | awk '{print $1}')
+      RAW_SIZE=$(du -sh "$MDB_FILE" | awk '{print $1}')
 
 
       PARAM1=$(echo "$RAW_SIZE" | awk '
