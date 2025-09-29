@@ -368,6 +368,8 @@ func (cache *BlockStateCache) ReadAccountIncarnation(address libcommon.Address) 
 }
 
 func (cache *BlockStateCache) GetDbStateReader(tx kv.Tx) (state.StateReader, error) {
-	reader := state.NewPlainState(tx, cache.prevHeight, systemcontracts.SystemContractCodeLookup[cache.chainName])
+	// For some reason, erigon's history state reader uses block number + 1 for the state reader at
+	// height x
+	reader := state.NewPlainState(tx, cache.prevHeight+1, systemcontracts.SystemContractCodeLookup[cache.chainName])
 	return reader, nil
 }
