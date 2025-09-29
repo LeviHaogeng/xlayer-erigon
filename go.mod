@@ -88,7 +88,7 @@ require (
 	github.com/pion/randutil v0.1.0
 	github.com/pion/stun v0.3.5
 	github.com/pkg/errors v0.9.1
-	github.com/prometheus/client_golang v1.19.0
+	github.com/prometheus/client_golang v1.19.1
 	github.com/prometheus/client_model v0.6.1
 	github.com/prometheus/common v0.48.0
 	github.com/protolambda/ztyp v0.2.2

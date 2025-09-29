@@ -2,6 +2,7 @@ package jsonrpc
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/ledgerwatch/erigon-lib/common"
@@ -19,7 +20,9 @@ func (api *APIImpl) NewPendingTransactionFilter(_ context.Context) (string, erro
 	if api.filters == nil {
 		return "", rpc.ErrNotificationsUnsupported
 	}
-	txsCh, id := api.filters.SubscribePendingTxs(32)
+	txsCh, id := api.filters.SubscribePendingTxsWithTTL(32)
+
+	log.Info(fmt.Sprintf("NewPendingTransactionFilter: id: %v", id))
 	go func() {
 		for txs := range txsCh {
 			api.filters.AddPendingTxs(id, txs)
@@ -33,7 +36,9 @@ func (api *APIImpl) NewBlockFilter(_ context.Context) (string, error) {
 	if api.filters == nil {
 		return "", rpc.ErrNotificationsUnsupported
 	}
-	ch, id := api.filters.SubscribeNewHeads(32)
+	ch, id := api.filters.SubscribeNewHeadsWithTTL(32)
+
+	log.Info(fmt.Sprintf("NewBlockFilter: id: %v", id))
 	go func() {
 		for block := range ch {
 			api.filters.AddPendingBlock(id, block)
@@ -47,7 +52,9 @@ func (api *APIImpl) NewFilter(_ context.Context, crit filters.FilterCriteria) (s
 	if api.filters == nil {
 		return "", rpc.ErrNotificationsUnsupported
 	}
-	logs, id := api.filters.SubscribeLogs(256, crit)
+	logs, id := api.filters.SubscribeLogsWithTTL(256, crit)
+
+	log.Info(fmt.Sprintf("NewFilter: id: %v", id))
 	go func() {
 		for lg := range logs {
 			api.filters.AddLogs(id, lg)

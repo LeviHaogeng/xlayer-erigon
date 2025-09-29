@@ -88,7 +88,7 @@ func TestSendRawTransaction(t *testing.T) {
 
 	ctx, conn := rpcdaemontest.CreateTestGrpcConn(t, mockSentry)
 	txPool := txpool.NewTxpoolClient(conn)
-	ff := rpchelper.New(ctx, nil, txPool, txpool.NewMiningClient(conn), func() {}, mockSentry.Log)
+	ff := rpchelper.New(ctx, rpchelper.DefaultFiltersConfig, nil, txPool, txpool.NewMiningClient(conn), func() {}, mockSentry.Log)
 	api := jsonrpc.NewEthAPI(newBaseApiForTest(mockSentry), mockSentry.DB, mockSentry.DBSMT, nil, txPool, nil, 5000000, 1e18, 100_000, &ethconfig.Defaults, false, 100_000, 128, logger, nil, 1000)
 	api.BadTxAllowance = 1
 
@@ -143,7 +143,7 @@ func TestSendRawTransactionUnprotected(t *testing.T) {
 
 	ctx, conn := rpcdaemontest.CreateTestGrpcConn(t, mockSentry)
 	txPool := txpool.NewTxpoolClient(conn)
-	ff := rpchelper.New(ctx, nil, txPool, txpool.NewMiningClient(conn), func() {}, mockSentry.Log)
+	ff := rpchelper.New(ctx, rpchelper.DefaultFiltersConfig, nil, txPool, txpool.NewMiningClient(conn), func() {}, mockSentry.Log)
 	api := jsonrpc.NewEthAPI(newBaseApiForTest(mockSentry), mockSentry.DB, mockSentry.DBSMT, nil, txPool, nil, 5000000, 1e18, 100_000, &ethconfig.Defaults, false, 100_000, 128, logger, nil, 1000)
 	api.BadTxAllowance = 1
 
