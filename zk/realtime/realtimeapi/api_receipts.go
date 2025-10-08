@@ -2,6 +2,7 @@ package realtimeapi
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon/rpc"
@@ -65,27 +66,34 @@ func (api *RealtimeAPIImpl) GetBlockReceipts(ctx context.Context, number rpc.Blo
 		return api.APIImpl.GetBlockReceipts(ctx, number)
 	}
 
-	blockNum, _, _, err := api.getBlockNumberOrHash(number)
+	blockNum, _, isPending, err := api.getBlockNumberOrHash(number)
 	if err != nil {
 		return api.APIImpl.GetBlockReceipts(ctx, number)
 	}
 
 	header, _, blockhash, ok := api.cacheDB.Stateless.GetBlockInfo(blockNum)
 	if !ok {
-		return api.APIImpl.GetBlockReceipts(ctx, number)
+		if isPending {
+			// Pending block not open yet. Default to latest block
+			blockNum = api.cacheDB.GetHighestConfirmHeight()
+			header, _, blockhash, ok = api.cacheDB.Stateless.GetBlockInfo(blockNum)
+			if !ok {
+				return nil, fmt.Errorf("header not found for block %d", blockNum)
+			}
+		} else {
+			return api.APIImpl.GetBlockReceipts(ctx, number)
+		}
 	}
 
 	txHashes, ok := api.cacheDB.Stateless.GetBlockTxs(blockNum)
 	if !ok {
 		return api.APIImpl.GetBlockReceipts(ctx, number)
 	}
-
 	tx, err := api.APIImpl.GetDB().BeginRo(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-
 	cc, err := api.APIImpl.GetChainConfig(ctx, tx)
 	if err != nil {
 		return nil, err

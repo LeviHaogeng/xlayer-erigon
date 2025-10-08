@@ -133,6 +133,9 @@ func (cache *StateCache) DebugDumpToFile(cacheDumpPath string) error {
 
 	accountData := make(map[string]string)
 	for addr, acc := range flatten.accountCache {
+		if _, ok := flatten.deletedAccountsCache[addr]; ok {
+			continue
+		}
 		value := make([]byte, acc.EncodingLengthForStorage())
 		acc.EncodeForStorage(value)
 		accountData[hex.EncodeToString(addr[:])] = hex.EncodeToString(value)
@@ -178,6 +181,21 @@ func (cache *StateCache) DebugCompare(reader state.StateReader) ([]string, error
 
 	mismatches := []string{}
 	for addr, accCache := range flatten.accountCache {
+		if _, ok := flatten.deletedAccountsCache[addr]; ok {
+			accDb, err := reader.ReadAccountData(addr)
+			if err != nil {
+				mismatch := fmt.Sprintf("chain-state db reader error, failed to read account. address: %s, error: %v", addr.String(), err)
+				mismatches = append(mismatches, mismatch)
+				continue
+			}
+			if accDb != nil {
+				mismatch := fmt.Sprintf("delete account %s mismatch, cache deleted but account found in database", addr.String())
+				mismatches = append(mismatches, mismatch)
+			}
+			continue
+		}
+
+		// Not deleted account, check for state consistency
 		accDb, err := reader.ReadAccountData(addr)
 		if err != nil {
 			mismatch := fmt.Sprintf("chain-state db reader error, failed to read account. address: %s, error: %v", addr.String(), err)

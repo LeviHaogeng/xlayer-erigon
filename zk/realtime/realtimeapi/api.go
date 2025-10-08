@@ -162,24 +162,35 @@ func newRPCTransaction_realtime(tx types.Transaction, txblockhash libcommon.Hash
 func (api *RealtimeAPIImpl) tryGetBlockResponseFromNumber(
 	blockNum uint64,
 	fullTx bool,
+	isPending bool,
 ) (map[string]interface{}, error) {
 	header, _, _, ok := api.cacheDB.Stateless.GetBlockInfo(blockNum)
 	if !ok {
-		return nil, fmt.Errorf("header not found for block %d", blockNum)
-	}
-
-	var transactions []types.Transaction
-	txHashes, ok := api.cacheDB.Stateless.GetBlockTxs(blockNum)
-	if ok {
-		for _, txHash := range txHashes {
-			if tx, _, _, _, exists := api.cacheDB.Stateless.GetTxInfo(txHash); exists {
-				transactions = append(transactions, tx)
-			} else {
-				return nil, fmt.Errorf("transaction %s not found in cache", txHash.Hex())
+		if isPending {
+			// Pending block not open yet. Default to latest block
+			blockNum = api.cacheDB.GetHighestConfirmHeight()
+			header, _, _, ok = api.cacheDB.Stateless.GetBlockInfo(blockNum)
+			if !ok {
+				return nil, fmt.Errorf("header not found for block %d", blockNum)
 			}
+			isPending = false
+		} else {
+			return nil, fmt.Errorf("header not found for block %d", blockNum)
 		}
 	}
 
+	txHashes, ok := api.cacheDB.Stateless.GetBlockTxs(blockNum)
+	if !ok {
+		return nil, fmt.Errorf("block txs not found for block %d", blockNum)
+	}
+	transactions := make([]types.Transaction, 0, len(txHashes))
+	for _, txHash := range txHashes {
+		txn, _, _, _, exists := api.cacheDB.Stateless.GetTxInfo(txHash)
+		if !exists {
+			return nil, fmt.Errorf("transaction %s not found in cache", txHash.Hex())
+		}
+		transactions = append(transactions, txn)
+	}
 	block := types.NewBlockWithHeader(header).WithBody(transactions, nil)
 
 	additionalFields := map[string]interface{}{
@@ -190,6 +201,19 @@ func (api *RealtimeAPIImpl) tryGetBlockResponseFromNumber(
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal block: %w", err)
 	}
-
+	if isPending {
+		for _, field := range []string{"hash"} {
+			response[field] = nil
+		}
+		if fullTx {
+			if txs, ok := response["transactions"].([]interface{}); ok {
+				for _, tx := range txs {
+					if rpcTx, ok := tx.(*ethapi.RPCTransaction); ok {
+						rpcTx.BlockHash = nil
+					}
+				}
+			}
+		}
+	}
 	return response, nil
 }

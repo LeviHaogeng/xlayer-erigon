@@ -15,6 +15,7 @@ import (
 	"github.com/holiman/uint256"
 	"github.com/iden3/go-iden3-crypto/keccak256"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/common/hexutil"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/crypto"
@@ -66,6 +67,17 @@ func TestRealtimeComparison(t *testing.T) {
 
 	erc20Address := deployERC20Contract(t, ctx, privateKey, client)
 
+	numberOfTransactions := 50
+	txHashes := transTokenBatch(t, context.Background(), client, uint256.NewInt(encoding.Gwei), testAddress.String(), numberOfTransactions)
+	lastTxHash := txHashes[len(txHashes)-1]
+
+	// Get the block information from the last transaction's receipt
+	receipt, err := client.RealtimeGetTransactionReceipt(libcommon.HexToHash(lastTxHash))
+	require.NoError(t, err)
+	require.NotNil(t, receipt, "Transaction receipt should not be nil")
+
+	blockNumberWith50Txs := receipt.BlockNumber.Uint64()
+
 	log.Info("Starting realtime comparison test", "realtimeURL", DefaultL2NetworkRealtimeURL, "nonRealtimeURL", DefaultL2NetworkNoRealtimeURL)
 
 	// TestStatelessAPIs - Block and Transaction Data
@@ -73,87 +85,46 @@ func TestRealtimeComparison(t *testing.T) {
 		log.Info("Running stateless comparison tests")
 
 		t.Run("getBlockByNumber", func(t *testing.T) {
-			allPassed := true
+			// Get block from realtime node
+			realtimeBlock, err := client.RealtimeGetBlockByNumber(blockNumberWith50Txs)
+			require.NoError(t, err, "Failed to get block from realtime node for %v: %v", blockNumberWith50Txs, err)
 
-			for _, blockParam := range testBlocks {
-				blockNumber, err := convertBlockParam(client, blockParam)
-				if err != nil {
-					t.Errorf("Failed to convert block parameter %v: %v", blockParam, err)
-					allPassed = false
-					continue
-				}
+			time.Sleep(1 * time.Second)
 
-				// Get block from realtime node
-				realtimeBlock, err := client.RealtimeGetBlockByNumber(blockNumber)
-				if err != nil {
-					t.Errorf("Failed to get block from realtime node for %v: %v", blockParam, err)
-					allPassed = false
-					continue
-				}
+			// Make direct RPC call to non-realtime node to get JSON response
+			var nonRealtimeMap map[string]interface{}
+			err = nonRealtimeRPCClient.CallContext(context.Background(), &nonRealtimeMap, "eth_getBlockByNumber", blockNumberWith50Txs, true)
+			require.NoError(t, err, "Failed to get block from non-realtime node for %v: %v", blockNumberWith50Txs, err)
 
-				// Make direct RPC call to non-realtime node to get JSON response
-				var nonRealtimeMap map[string]interface{}
-				err = nonRealtimeRPCClient.CallContext(context.Background(), &nonRealtimeMap, "eth_getBlockByNumber", blockParam, true)
-				if err != nil {
-					t.Errorf("Failed to get block from non-realtime node for %v: %v", blockParam, err)
-					allPassed = false
-					continue
-				}
+			fmt.Printf("\nComparing block %v\n", blockNumberWith50Txs)
 
-				err = CompareBlock(realtimeBlock, nonRealtimeMap, fmt.Sprintf("block_%v", blockParam))
-				if err != nil {
-					t.Errorf("Block responses differ for %v: %v", blockParam, err)
-					allPassed = false
-				}
-			}
-			require.True(t, allPassed, "getBlockByNumber test failed - some scenarios did not pass")
+			err = CompareBlock(realtimeBlock, nonRealtimeMap, fmt.Sprintf("block_%v", blockNumberWith50Txs))
+			require.NoError(t, err, "Block responses differ for %v: %v", blockNumberWith50Txs, err)
 		})
 
 		t.Run("getBlockByHash", func(t *testing.T) {
-			allPassed := true
-			for _, blockParam := range testBlocks {
-				blockNumber, err := convertBlockParam(client, blockParam)
-				if err != nil {
-					t.Logf("Failed to convert block parameter %v: %v", blockParam, err)
-					continue
-				}
+			blockWith50Txs, err := client.RealtimeGetBlockByNumber(blockNumberWith50Txs)
+			require.NoError(t, err, "Failed to get block %v by number: %v", blockNumberWith50Txs, err)
 
-				blockByNumber, err := client.RealtimeGetBlockByNumber(blockNumber)
-				if err != nil {
-					t.Logf("Could not get block %v by number: %v", blockParam, err)
-					continue
-				}
+			blockHash, ok := extractBlockHash(blockWith50Txs, hexutil.EncodeUint64(blockNumberWith50Txs))
+			require.True(t, ok, "Block %v does not have a valid hash", blockNumberWith50Txs)
 
-				blockHash, ok := extractBlockHash(blockByNumber, blockParam)
-				if !ok {
-					t.Logf("Block %v does not have a valid hash", blockParam)
-					continue
-				}
-				log.Info(fmt.Sprintf("Comparing block %v by hash: %s", blockParam, blockHash.Hex()))
+			log.Info(fmt.Sprintf("Comparing block %v by hash: %s", blockNumberWith50Txs, blockHash.Hex()))
 
-				// Get block from realtime node
-				realtimeBlock, err := client.RealtimeGetBlockByHash(blockHash, true)
-				if err != nil {
-					t.Errorf("Failed to get block from realtime node for %v: %v", blockParam, err)
-					allPassed = false
-					continue
-				}
+			// Get block from realtime node using the hash
+			realtimeBlock, err := client.RealtimeGetBlockByHash(blockHash, true)
+			require.NoError(t, err, "Failed to get block from realtime node for %v: %v", blockNumberWith50Txs, err)
 
-				var nonRealtimeMap map[string]interface{}
-				err = nonRealtimeRPCClient.CallContext(context.Background(), &nonRealtimeMap, "eth_getBlockByHash", blockHash, true)
-				if err != nil {
-					t.Errorf("Failed to get block from non-realtime node for %v: %v", blockParam, err)
-					allPassed = false
-					continue
-				}
+			time.Sleep(1 * time.Second)
 
-				err = CompareBlock(realtimeBlock, nonRealtimeMap, fmt.Sprintf("block_%v_hash", blockParam))
-				if err != nil {
-					t.Errorf("Block responses differ for %v hash %s: %v", blockParam, blockHash.Hex(), err)
-					allPassed = false
-				}
-			}
-			require.True(t, allPassed, "getBlockByHash test failed - some scenarios did not pass")
+			var nonRealtimeMap map[string]interface{}
+			err = nonRealtimeRPCClient.CallContext(context.Background(), &nonRealtimeMap, "eth_getBlockByHash", blockHash, true)
+			require.NoError(t, err, "Failed to get block from non-realtime node for %v: %v", blockNumberWith50Txs, err)
+
+			fmt.Printf("\nComparing block %v by hash: %s\n", blockNumberWith50Txs, blockHash.Hex())
+
+			err = CompareBlock(realtimeBlock, nonRealtimeMap, fmt.Sprintf("block_%v_hash", blockNumberWith50Txs))
+			require.NoError(t, err, "Block responses differ for %v hash %s: %v", blockNumberWith50Txs, blockHash.Hex(), err)
 		})
 
 		t.Run("getBlockTransactionCountByNumber", func(t *testing.T) {
@@ -326,8 +297,8 @@ func TestRealtimeComparison(t *testing.T) {
 	})
 
 	// TestStateAPIs - Balances, Code, Storage, and Contract Calls
-	// Sleep to let non-RT RPC catch up
-	time.Sleep(5 * time.Second)
+	waitForNodeSync(t, client, nonRealtimeRPCClient, 30*time.Second)
+
 	t.Run("TestStateAPIs", func(t *testing.T) {
 		log.Info("Running state comparison tests")
 
@@ -467,4 +438,55 @@ func TestRealtimeComparison(t *testing.T) {
 			}
 		})
 	})
+}
+
+// waitForNodeSync waits for both nodes to synchronize to the same block height
+func waitForNodeSync(
+	t *testing.T,
+	realtimeClient *rtclient.RealtimeClient,
+	nonRealtimeRPCClient *rpc.Client,
+	timeout time.Duration,
+) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("Timeout waiting for node synchronization after %v", timeout)
+
+		case <-ticker.C:
+			// Get block number from realtime node
+			realtimeBlockNumber, err := realtimeClient.RealtimeBlockNumber()
+			if err != nil {
+				t.Logf("Error getting realtime block number: %v", err)
+				continue
+			}
+
+			// Get block number from non-realtime node
+			var nonRealtimeBlockNumberHex string
+			err = nonRealtimeRPCClient.CallContext(ctx, &nonRealtimeBlockNumberHex, "eth_blockNumber")
+			if err != nil {
+				t.Logf("Error getting non-realtime block number: %v", err)
+				continue
+			}
+
+			nonRealtimeBlockNumber, err := strconv.ParseUint(strings.TrimPrefix(nonRealtimeBlockNumberHex, "0x"), 16, 64)
+			if err != nil {
+				t.Logf("Error parsing non-realtime block number %q: %v", nonRealtimeBlockNumberHex, err)
+				continue
+			}
+
+			log.Info("Block sync check: realtime=%d, non-realtime=%d", realtimeBlockNumber, nonRealtimeBlockNumber)
+
+			// Consider synced if non-realtime is within 1 block of realtime
+			if nonRealtimeBlockNumber >= realtimeBlockNumber-1 {
+				log.Info("Nodes are synchronized")
+				return
+			}
+		}
+	}
 }
