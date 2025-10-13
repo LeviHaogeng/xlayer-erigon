@@ -1247,22 +1247,10 @@ func TestBatchOptimizationWithRealDatastreamRunner(t *testing.T) {
 
 			// Stop reading
 			runner.StopRead()
-
-			// Wait longer for the runner to fully stop, as datastream operations can be slow
-			maxWaitTime := 2 * time.Second
-			waitInterval := 50 * time.Millisecond
-			stopped := false
-
-			for elapsed := time.Duration(0); elapsed < maxWaitTime; elapsed += waitInterval {
-				time.Sleep(waitInterval)
-				if !runner.isReading.Load() {
-					stopped = true
-					break
-				}
-			}
+			time.Sleep(200 * time.Millisecond)
 
 			// Verify runner stopped
-			require.True(t, stopped, "Runner should have stopped within %v", maxWaitTime)
+			require.False(t, runner.isReading.Load(), "Runner should have stopped")
 
 			t.Logf("✅ Real DatastreamClientRunner with batch optimization working")
 		} else {
@@ -1280,17 +1268,12 @@ func TestBatchOptimizationWithRealDatastreamRunner(t *testing.T) {
 			t.Logf("✅ Real DatastreamClientRunner with standard mode working")
 		}
 
-		// Check for errors - only bookmark-related errors are expected in optimized mode
+		// Verify no errors were reported
 		select {
 		case <-errorChan:
-			// In optimized mode with test servers, bookmark errors are expected
-			if cfg.zkCfg.XLayer.DataStreamBatchOptimizationEnabled {
-				t.Logf("⚠️  Error reported by runner in optimized mode (expected for test servers)")
-			} else {
-				t.Fatal("Unexpected error reported by runner in standard mode")
-			}
+			t.Fatal("Unexpected error reported by runner")
 		default:
-			t.Logf("✅ No errors reported by runner")
+			// No error - good
 		}
 
 		// Clean up global manager
