@@ -1,0 +1,375 @@
+package cache
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"sync"
+
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/kv"
+	"github.com/ledgerwatch/erigon-lib/kv/dbutils"
+	"github.com/ledgerwatch/erigon/core/state"
+	"github.com/ledgerwatch/erigon/core/systemcontracts"
+	"github.com/ledgerwatch/erigon/core/types/accounts"
+	"github.com/ledgerwatch/erigon/turbo/trie"
+	realtimeTypes "github.com/ledgerwatch/erigon/zk/realtime/types"
+	"github.com/ledgerwatch/log/v3"
+)
+
+const DefaultPlainStateCacheSize = 1_000
+
+// BlockStateCache is a double-linked list that implements the plain state reader
+// with a changeset cache layer. The block state cache holds the block chainstate,
+// and the previous block state cache reader.
+type BlockStateCache struct {
+	// Chaindb
+	ctx       context.Context
+	db        kv.RoDB
+	chainName string
+
+	// Cache
+	cacheLock  sync.RWMutex
+	cache      *plainStateCache
+	height     uint64
+	prevHeight uint64
+
+	// Double-linked list holding previous and next block state caches
+	prevCache *BlockStateCache
+	nextCache *BlockStateCache
+}
+
+func NewBlockStateCache(ctx context.Context, db kv.RoDB, chainName string, height uint64) *BlockStateCache {
+	return &BlockStateCache{
+		ctx:        ctx,
+		db:         db,
+		chainName:  chainName,
+		height:     height,
+		prevHeight: height - 1,
+		cache:      newPlainStateCache(DefaultPlainStateCacheSize),
+		nextCache:  nil,
+		prevCache:  nil,
+	}
+}
+
+// -------------- Linked list operations --------------
+func (cache *BlockStateCache) GetNextBlockCache() *BlockStateCache {
+	cache.cacheLock.RLock()
+	defer cache.cacheLock.RUnlock()
+	return cache.nextCache
+}
+
+func (cache *BlockStateCache) SetNextBlockCache(nextBlockCache *BlockStateCache) {
+	cache.cacheLock.Lock()
+	defer cache.cacheLock.Unlock()
+	cache.nextCache = nextBlockCache
+}
+
+func (cache *BlockStateCache) GetPrevBlockCache() *BlockStateCache {
+	cache.cacheLock.RLock()
+	defer cache.cacheLock.RUnlock()
+	return cache.prevCache
+}
+
+func (cache *BlockStateCache) SetPrevBlockCache(prevBlockCache *BlockStateCache) {
+	cache.cacheLock.Lock()
+	defer cache.cacheLock.Unlock()
+	cache.prevCache = prevBlockCache
+}
+
+func (cache *BlockStateCache) Clear() {
+	cache.cacheLock.Lock()
+	defer cache.cacheLock.Unlock()
+
+	// Clear the plain state cache
+	cache.cache.Clear()
+
+	// Clear linked list references to prevent circular references
+	cache.nextCache = nil
+	cache.prevCache = nil
+}
+
+// -------------- State apply operations --------------
+func (cache *BlockStateCache) ApplyChangeset(changeset *realtimeTypes.Changeset, blockNumber uint64) error {
+	cache.cacheLock.Lock()
+	defer cache.cacheLock.Unlock()
+
+	// Handle account data changes
+	addressChanges := make(map[libcommon.Address]*accounts.Account)
+	cache.applyChangesetToAccountData(changeset, addressChanges)
+
+	// Apply code changes
+	for codeHash, code := range changeset.CodeChanges {
+		cache.cache.codeCache[codeHash] = code
+	}
+
+	// Apply storage changes
+	for address, storage := range changeset.StorageChanges {
+		account, err := cache.getOrCreateAccount(address, addressChanges)
+		if err != nil {
+			return fmt.Errorf("apply storage changes failed: %v", err)
+		}
+
+		for key, value := range storage {
+			compositeKey := dbutils.PlainGenerateCompositeStorageKey(address.Bytes(), account.Incarnation, key.Bytes())
+			cache.cache.storageCache[string(compositeKey)] = value
+		}
+	}
+
+	// Apply incarnation map changes
+	for address, incarnation := range changeset.IncarnationMapChanges {
+		cache.cache.incarnationMapCache[address] = incarnation
+	}
+
+	// Apply deleted accounts changes
+	for address := range changeset.DeletedAccounts {
+		cache.cache.deletedAccountsCache[address] = struct{}{}
+		// Non-existent / deleted accounts are set to nil
+		addressChanges[address] = nil
+	}
+
+	// Apply account changes
+	for address, account := range addressChanges {
+		delete(cache.cache.accountCache, address)
+		cache.cache.accountCache[address] = account
+		log.Debug(fmt.Sprintf("[Realtime] ApplyChangeset: %s", address))
+	}
+
+	return nil
+}
+
+func (cache *BlockStateCache) applyChangesetToAccountData(changeset *realtimeTypes.Changeset, addressChanges map[libcommon.Address]*accounts.Account) (err error) {
+	// Apply balance changes
+	for address, balance := range changeset.BalanceChanges {
+		if _, ok := changeset.DeletedAccounts[address]; ok {
+			continue
+		}
+
+		account, err := cache.getOrCreateAccount(address, addressChanges)
+		if err != nil {
+			return fmt.Errorf("apply balance changes failed: %v", err)
+		}
+		account.Balance.Set(balance)
+	}
+
+	// Apply nonce changes
+	for address, nonce := range changeset.NonceChanges {
+		if _, ok := changeset.DeletedAccounts[address]; ok {
+			continue
+		}
+
+		account, err := cache.getOrCreateAccount(address, addressChanges)
+		if err != nil {
+			return fmt.Errorf("apply nonce changes failed: %v", err)
+		}
+		account.Nonce = nonce
+	}
+
+	// Apply code hash changes
+	for address, codeHash := range changeset.CodeHashChanges {
+		if _, ok := changeset.DeletedAccounts[address]; ok {
+			continue
+		}
+
+		account, err := cache.getOrCreateAccount(address, addressChanges)
+		if err != nil {
+			return fmt.Errorf("apply code hash changes failed: %v", err)
+		}
+		account.CodeHash = codeHash
+	}
+
+	// Apply incarnation changes
+	for address, incarnation := range changeset.IncarnationChanges {
+		if _, ok := changeset.DeletedAccounts[address]; ok {
+			continue
+		}
+
+		account, err := cache.getOrCreateAccount(address, addressChanges)
+		if err != nil {
+			return fmt.Errorf("apply incarnation changes failed: %v", err)
+		}
+		account.Incarnation = incarnation
+	}
+
+	return nil
+}
+
+func (cache *BlockStateCache) getOrCreateAccount(address libcommon.Address, addressChanges map[libcommon.Address]*accounts.Account) (*accounts.Account, error) {
+	account, ok := addressChanges[address]
+	if !ok {
+		var err error
+		account, err = cache.unsafeReadAccountData(address)
+		if err != nil {
+			return nil, err
+		}
+
+		if account == nil {
+			// Non-existent account, create new account
+			account, err = cache.createAccount()
+			if err != nil {
+				return nil, err
+			}
+		}
+		addressChanges[address] = account
+	}
+
+	return account, nil
+}
+
+func (cache *BlockStateCache) unsafeReadAccountData(address libcommon.Address) (*accounts.Account, error) {
+	acc, ok := cache.cache.accountCache[address]
+	if ok {
+		return acc, nil
+	}
+
+	// Cache miss
+	if cache.prevCache == nil {
+		tx, err := cache.db.BeginRo(cache.ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		reader, err := cache.GetDbStateReader(tx)
+		if err != nil {
+			return nil, err
+		}
+		return reader.ReadAccountData(address)
+	}
+	return cache.prevCache.ReadAccountData(address)
+}
+
+func (cache *BlockStateCache) createAccount() (*accounts.Account, error) {
+	return &accounts.Account{
+		Initialised: true,
+		Root:        libcommon.BytesToHash(trie.EmptyRoot[:]),
+		CodeHash:    libcommon.BytesToHash(emptyCodeHash),
+	}, nil
+}
+
+// -------------- StateReader implementation --------------
+func (cache *BlockStateCache) ReadAccountData(address libcommon.Address) (*accounts.Account, error) {
+	cache.cacheLock.RLock()
+	defer cache.cacheLock.RUnlock()
+
+	acc, ok := cache.cache.accountCache[address]
+	if ok {
+		accCopy := accounts.DeepCopyAccount(acc)
+		return accCopy, nil
+	}
+	// Check if the account is deleted
+	if _, ok := cache.cache.deletedAccountsCache[address]; ok {
+		return nil, nil
+	}
+	// Cache miss
+	if cache.prevCache == nil {
+		tx, err := cache.db.BeginRo(cache.ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		reader, err := cache.GetDbStateReader(tx)
+		if err != nil {
+			return nil, err
+		}
+		return reader.ReadAccountData(address)
+	}
+	return cache.prevCache.ReadAccountData(address)
+}
+
+func (cache *BlockStateCache) ReadAccountStorage(address libcommon.Address, incarnation uint64, key *libcommon.Hash) ([]byte, error) {
+	compositeKey := dbutils.PlainGenerateCompositeStorageKey(address.Bytes(), incarnation, key.Bytes())
+	cache.cacheLock.RLock()
+	defer cache.cacheLock.RUnlock()
+
+	storage, ok := cache.cache.storageCache[string(compositeKey)]
+	if ok {
+		storageCopy := libcommon.Copy(storage.Bytes())
+		return storageCopy, nil
+	}
+	// Check if the account is deleted
+	if _, ok := cache.cache.deletedAccountsCache[address]; ok {
+		return nil, nil
+	}
+	// Cache miss
+	if cache.prevCache == nil {
+		tx, err := cache.db.BeginRo(cache.ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		reader, err := cache.GetDbStateReader(tx)
+		if err != nil {
+			return nil, err
+		}
+		return reader.ReadAccountStorage(address, incarnation, key)
+	}
+	return cache.prevCache.ReadAccountStorage(address, incarnation, key)
+}
+
+func (cache *BlockStateCache) ReadAccountCode(address libcommon.Address, incarnation uint64, codeHash libcommon.Hash) ([]byte, error) {
+	if bytes.Equal(codeHash.Bytes(), emptyCodeHash) {
+		return nil, nil
+	}
+	cache.cacheLock.RLock()
+	defer cache.cacheLock.RUnlock()
+
+	code, ok := cache.cache.codeCache[codeHash]
+	if ok {
+		codeCopy := libcommon.Copy(code)
+		return codeCopy, nil
+	}
+	// Check if the account is deleted
+	if _, ok := cache.cache.deletedAccountsCache[address]; ok {
+		return nil, nil
+	}
+	// Cache miss
+	if cache.prevCache == nil {
+		tx, err := cache.db.BeginRo(cache.ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		reader, err := cache.GetDbStateReader(tx)
+		if err != nil {
+			return nil, err
+		}
+		return reader.ReadAccountCode(address, incarnation, codeHash)
+	}
+	return cache.prevCache.ReadAccountCode(address, incarnation, codeHash)
+}
+
+func (cache *BlockStateCache) ReadAccountCodeSize(address libcommon.Address, incarnation uint64, codeHash libcommon.Hash) (int, error) {
+	code, err := cache.ReadAccountCode(address, incarnation, codeHash)
+	return len(code), err
+}
+
+func (cache *BlockStateCache) ReadAccountIncarnation(address libcommon.Address) (uint64, error) {
+	cache.cacheLock.RLock()
+	defer cache.cacheLock.RUnlock()
+
+	incarnation, ok := cache.cache.incarnationMapCache[address]
+	if ok {
+		return incarnation, nil
+	}
+	// Cache miss
+	if cache.prevCache == nil {
+		tx, err := cache.db.BeginRo(cache.ctx)
+		if err != nil {
+			return 0, err
+		}
+		defer tx.Rollback()
+		reader, err := cache.GetDbStateReader(tx)
+		if err != nil {
+			return 0, err
+		}
+		return reader.ReadAccountIncarnation(address)
+	}
+	return cache.prevCache.ReadAccountIncarnation(address)
+}
+
+func (cache *BlockStateCache) GetDbStateReader(tx kv.Tx) (state.StateReader, error) {
+	// For some reason, erigon's history state reader uses block number + 1 for the state reader at
+	// height x
+	reader := state.NewPlainState(tx, cache.prevHeight+1, systemcontracts.SystemContractCodeLookup[cache.chainName])
+	return reader, nil
+}

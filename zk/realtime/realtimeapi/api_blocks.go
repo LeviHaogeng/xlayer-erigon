@@ -2,6 +2,7 @@ package realtimeapi
 
 import (
 	"context"
+	"fmt"
 
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/hexutil"
@@ -20,7 +21,7 @@ func (api *RealtimeAPIImpl) BlockNumber(ctx context.Context, tag *RealtimeTag) (
 		tag = &latestTag
 	}
 
-	blockNumber, _, err := api.getBlockNumber(rpc.BlockNumber(*tag))
+	blockNumber, _, _, err := api.getBlockNumber(rpc.BlockNumber(*tag))
 	if err != nil {
 		// Do not redirect to default eth api as block number with tag is custom for realtime
 		return hexutil.Uint64(0), err
@@ -33,14 +34,19 @@ func (api *RealtimeAPIImpl) GetBlockTransactionCountByNumber(ctx context.Context
 		return api.APIImpl.GetBlockTransactionCountByNumber(ctx, blockNr)
 	}
 
-	blockNum, _, err := api.getBlockNumber(blockNr)
+	blockNum, _, isPending, err := api.getBlockNumber(blockNr)
 	if err != nil {
 		return api.APIImpl.GetBlockTransactionCountByNumber(ctx, blockNr)
 	}
 
-	_, _, _, ok := api.cacheDB.Stateless.GetHeader(blockNum)
+	_, _, _, ok := api.cacheDB.Stateless.GetBlockInfo(blockNum)
 	if !ok {
-		return api.APIImpl.GetBlockTransactionCountByNumber(ctx, blockNr)
+		if isPending {
+			numOfTx := hexutil.Uint(0)
+			return &numOfTx, nil
+		} else {
+			return api.APIImpl.GetBlockTransactionCountByNumber(ctx, blockNr)
+		}
 	}
 
 	txs, ok := api.cacheDB.Stateless.GetBlockTxs(blockNum)
@@ -79,20 +85,14 @@ func (api *RealtimeAPIImpl) GetBlockByNumber(ctx context.Context, blockNr rpc.Bl
 		fullTx = new(bool)
 	}
 
-	blockNum, _, err := api.getBlockNumber(blockNr)
+	blockNum, _, isPending, err := api.getBlockNumber(blockNr)
 	if err != nil {
 		return api.APIImpl.GetBlockByNumber(ctx, blockNr, fullTx)
 	}
 
-	response, err := api.tryGetBlockResponseFromNumber(blockNum, *fullTx)
+	response, err := api.tryGetBlockResponseFromNumber(blockNum, *fullTx, isPending)
 	if err != nil {
 		return api.APIImpl.GetBlockByNumber(ctx, blockNr, fullTx)
-	}
-
-	if blockNr == rpc.PendingBlockNumber {
-		for _, field := range []string{"hash", "nonce", "miner"} {
-			response[field] = nil
-		}
 	}
 
 	return response, nil
@@ -120,7 +120,7 @@ func (api *RealtimeAPIImpl) GetBlockByHash(ctx context.Context, numberOrHash rpc
 		return api.APIImpl.GetBlockByHash(ctx, numberOrHash, fullTx)
 	}
 
-	response, err := api.tryGetBlockResponseFromNumber(blockNum, *fullTx)
+	response, err := api.tryGetBlockResponseFromNumber(blockNum, *fullTx, false)
 	if err != nil {
 		return api.APIImpl.GetBlockByHash(ctx, numberOrHash, fullTx)
 	}
@@ -133,14 +133,23 @@ func (api *RealtimeAPIImpl) GetBlockInternalTransactions(ctx context.Context, bl
 		return api.APIImpl.GetBlockInternalTransactions(ctx, blockNr)
 	}
 
-	blockNum, _, err := api.getBlockNumber(blockNr)
+	blockNum, _, isPending, err := api.getBlockNumber(blockNr)
 	if err != nil {
 		return api.APIImpl.GetBlockInternalTransactions(ctx, blockNr)
 	}
 
-	_, _, _, ok := api.cacheDB.Stateless.GetHeader(blockNum)
+	_, _, _, ok := api.cacheDB.Stateless.GetBlockInfo(blockNum)
 	if !ok {
-		return api.APIImpl.GetBlockInternalTransactions(ctx, blockNr)
+		if isPending {
+			// Pending block not open yet. Default to latest block
+			blockNum = api.cacheDB.GetHighestConfirmHeight()
+			_, _, _, ok = api.cacheDB.Stateless.GetBlockInfo(blockNum)
+			if !ok {
+				return nil, fmt.Errorf("header not found for block %d", blockNum)
+			}
+		} else {
+			return api.APIImpl.GetBlockInternalTransactions(ctx, blockNr)
+		}
 	}
 
 	txHashes, ok := api.cacheDB.Stateless.GetBlockTxs(blockNum)

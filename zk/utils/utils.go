@@ -64,9 +64,14 @@ func ShouldShortCircuitExecution(tx kv.RwTx, logPrefix string, l2ShortCircuitToV
 		}
 
 		// we've got the highest batch to execute to, now get it's highest block
-		shortCircuitBlock, _, err = hermezDb.GetHighestBlockInBatch(shortCircuitBatch)
+		var found bool
+		shortCircuitBlock, found, err = hermezDb.GetHighestBlockInBatch(shortCircuitBatch)
 		if err != nil {
 			return false, 0, err
+		}
+
+		if !found {
+			log.Warn("No blocks found in short circuit batch, disabling short circuit", "batchNumber", shortCircuitBatch)
 		}
 	}
 
@@ -99,6 +104,13 @@ func UpdateZkEVMBlockCfg(cfg ForkConfigWriter, hermezDb ForkReader, logPrefix st
 			log.Error(fmt.Sprintf("[%s] Error setting fork id %v to block %v", logPrefix, forkId, blockNum))
 			return err
 		}
+	}
+
+	// X Layer, dencun upgrade
+	block := chain.GetForkBlock(chain.ForkId13Dencun)
+	if err := cfg.SetForkIdBlock(chain.ForkId13Dencun, block); err != nil {
+		log.Error(fmt.Sprintf("[%s] Error setting fork id %v to block %v", logPrefix, chain.ForkId13Dencun, block))
+		return err
 	}
 	return nil
 }

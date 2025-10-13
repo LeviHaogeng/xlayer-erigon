@@ -28,12 +28,15 @@ import (
 	"github.com/ledgerwatch/erigon/core/types/accounts"
 	"github.com/ledgerwatch/erigon/crypto"
 	"github.com/ledgerwatch/erigon/ethclient"
+	"github.com/ledgerwatch/erigon/rpc"
 	"github.com/ledgerwatch/erigon/test/operations"
+	"github.com/ledgerwatch/erigon/zk/realtime/realtimeapi"
 	"github.com/ledgerwatch/erigon/zk/realtime/rtclient"
 	zktypes "github.com/ledgerwatch/erigon/zk/types"
 	"github.com/ledgerwatch/erigon/zkevm/encoding"
 	"github.com/ledgerwatch/log/v3"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestRealtimeRPC(t *testing.T) {
@@ -103,6 +106,14 @@ func TestRealtimeRPC(t *testing.T) {
 		includeExtraInfo := true
 		result, err := client.RealtimeGetTransactionByHash(common.HexToHash(txHash), &includeExtraInfo)
 		require.NoError(t, err)
+
+		receipt, err := client.RealtimeGetTransactionReceipt(common.HexToHash(txHash))
+		require.NoError(t, err)
+		require.NotNil(t, receipt, "GetTransactionReceipt should return receipt")
+
+		txHashIndex := int(*result.TransactionIndex)
+		receiptIndex := int(receipt.TransactionIndex)
+		require.Equal(t, receiptIndex, txHashIndex)
 		log.Info(fmt.Sprintf("RealtimeGetTransactionByHash result type: %T", result))
 	})
 
@@ -148,7 +159,7 @@ func TestRealtimeRPC(t *testing.T) {
 
 	t.Run("RealtimeGetStorageAt", func(t *testing.T) {
 		// 0x2 is refered to _totalSupply field
-		value, err := client.RealtimeGetStorageAt(erc20Address, "0x2")
+		value, err := client.RealtimeGetStorageAt(erc20Address, "0x2", "pending")
 		require.NoError(t, err)
 		require.Equal(t, "0x00000000000000000000000000000000000000000052b7d2dcc80cd2e4000000", value, "Storage at index 0x2 should be equal to 1000000000000000000000")
 		log.Info(fmt.Sprintf("RealtimeGetStorageAt result for erc20 contract %s at index %s: %s", erc20Address, "0x2", value))
@@ -190,6 +201,50 @@ func TestRealtimeRPC(t *testing.T) {
 		require.Greater(t, gasEstimateCall, gasEstimate, "Contract call should require more gas than simple transfer")
 	})
 
+	// Test call for block height specific
+	t.Run("RealtimeCallWithHeight", func(t *testing.T) {
+		data, err := erc20ABI.Pack("balanceOf", fromAddress)
+		require.NoError(t, err)
+
+		startValue, err := client.RealtimeCall(testAddress, erc20Address, "0x100000", "0x1", "0x0", fmt.Sprintf("0x%x", data))
+		require.NoError(t, err)
+		require.Equal(t, "0x00000000000000000000000000000000000000000052b7d2dcc80cd2e4000000", startValue, fmt.Sprintf("Balance of %s should be equal to 1e+26", fromAddress))
+
+		// Send balance transfer
+		transferAmount := new(big.Int).Mul(big.NewInt(1), big.NewInt(1e18)) // Adjust for token decimals (18 in this case)
+		nonce, err := client.RealtimeGetTransactionCount(fromAddress)
+		require.NoError(t, err)
+		signedTx := erc20TransferTx(t, ctx, privateKey, client, transferAmount, nil, testAddress, erc20Address, nonce)
+		err = WaitTxToBeMined(ctx, client, signedTx, DefaultTimeoutTxToBeMined)
+		require.NoError(t, err)
+
+		// Get tx block number
+		receipt, err := client.RealtimeGetTransactionReceipt(signedTx.Hash())
+		require.NoError(t, err)
+		require.NotNil(t, receipt)
+		targetBlockNumber := receipt.BlockNumber.Uint64()
+
+		correctValue, err := client.RealtimeCall(testAddress, erc20Address, "0x100000", "0x1", "0x0", fmt.Sprintf("0x%x", data))
+		require.NoError(t, err)
+		require.Equal(t, "0x00000000000000000000000000000000000000000052b7d2cee7561f3c9c0000", correctValue, fmt.Sprintf("Balance of %s should be equal to 9.9999999e+25 after transfer", fromAddress))
+		require.NotEqual(t, startValue, correctValue)
+
+		// Send balance transfer
+		signedTx = erc20TransferTx(t, ctx, privateKey, client, transferAmount, nil, testAddress, erc20Address, nonce+1)
+		err = WaitTxToBeMined(ctx, client, signedTx, DefaultTimeoutTxToBeMined)
+		require.NoError(t, err)
+
+		endValue, err := client.RealtimeCall(testAddress, erc20Address, "0x100000", "0x1", "0x0", fmt.Sprintf("0x%x", data))
+		require.NoError(t, err)
+		require.NotEqual(t, endValue, correctValue)
+		require.Equal(t, "0x00000000000000000000000000000000000000000052b7d2c1069f6b95380000", endValue, fmt.Sprintf("Balance of %s should be equal to 9.9999998e+25 after transfer", fromAddress))
+
+		// Get block height specific state
+		testValue, err := GetErc20Balance(ctx, client, testAddress, erc20Address, new(big.Int).SetUint64(targetBlockNumber))
+		require.NoError(t, err)
+		require.NotEqual(t, testValue, correctValue)
+	})
+
 	t.Run("RealtimeGetBlockByNumber", func(t *testing.T) {
 		latestBlockNumber, err := client.RealtimeBlockNumber()
 		if err != nil {
@@ -199,8 +254,15 @@ func TestRealtimeRPC(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, block, "Block should not be nil")
 		require.NotNil(t, block["hash"], "Block hash should not be nil")
-
 		log.Info(fmt.Sprintf("RealtimeGetBlockByNumber result block number: %v, hash: %v, txCount: %v", block["number"], block["hash"], len(block["transactions"].([]interface{}))))
+	})
+
+	t.Run("RealtimeGetPendingBlock", func(t *testing.T) {
+		pendingBlock, err := client.RealtimeGetBlock("pending")
+		require.NoError(t, err)
+		require.NotNil(t, pendingBlock, "Pending block should not be nil")
+		require.Nil(t, pendingBlock["hash"], "Block hash should be nil")
+		fmt.Printf("RealtimeGetBlock result block number: %v, txCount: %v\n", pendingBlock["number"], len(pendingBlock["transactions"].([]interface{})))
 	})
 
 	t.Run("RealtimeGetBlockByHash", func(t *testing.T) {
@@ -287,6 +349,37 @@ func TestRealtimeRPC(t *testing.T) {
 		log.Info(fmt.Sprintf("RealtimeGetBlockInternalTransactions successfully returned data for block %d", targetBlockNumber))
 	})
 
+	t.Run("RealtimeGetBlockReceipts", func(t *testing.T) {
+		numberOfTransactions := 10
+
+		// Create the specified number of transactions and wait for them to be mined
+		txHashes := transTokenBatch(t, context.Background(), client, uint256.NewInt(encoding.Gwei), testAddress.String(), numberOfTransactions)
+		lastTxHash := txHashes[len(txHashes)-1]
+
+		// Get the block information from the last transaction's receipt
+		receipt, err := client.RealtimeGetTransactionReceipt(common.HexToHash(lastTxHash))
+		require.NoError(t, err)
+		require.NotNil(t, receipt, "Transaction receipt should not be nil")
+
+		receiptsByNumber, err := client.RealtimeGetBlockReceiptsByNumber(receipt.BlockNumber.Uint64())
+		require.NoError(t, err)
+		require.NotNil(t, receiptsByNumber, "Transaction receipts by number should not be nil")
+		for _, receipt := range receiptsByNumber {
+			require.NoError(t, err)
+			require.NotNil(t, receipt)
+			log.Info(fmt.Sprintf("RealtimeGetBlockReceiptsByNumber result type: %T", receipt))
+		}
+
+		receiptsByHash, err := client.RealtimeGetBlockReceiptsByHash(receipt.BlockHash)
+		require.NoError(t, err)
+		require.NotNil(t, receiptsByHash, "Transaction receipts by hash should not be nil")
+		for _, receipt := range receiptsByHash {
+			require.NoError(t, err)
+			require.NotNil(t, receipt)
+			log.Info(fmt.Sprintf("RealtimeGetBlockReceiptsByHash result type: %T", receipt))
+		}
+	})
+
 	t.Run("RealtimeEnabled", func(t *testing.T) {
 		// Test with valid "pending" tag
 		isEnabled, err := client.RealtimeEnabled()
@@ -311,7 +404,7 @@ func TestRealtimeRPC(t *testing.T) {
 		transferAmount := new(big.Int).Mul(big.NewInt(1), big.NewInt(1e18))
 		nonce, err := client.RealtimeGetTransactionCount(fromAddress)
 		require.NoError(t, err)
-		signedTx := erc20TransferTx(t, ctx, privateKey, client, transferAmount, testAddress, erc20Address, nonce)
+		signedTx := erc20TransferTx(t, ctx, privateKey, client, transferAmount, nil, testAddress, erc20Address, nonce)
 		err = WaitTxToBeMined(ctx, client, signedTx, DefaultTimeoutTxToBeMined)
 		require.NoError(t, err)
 
@@ -337,6 +430,177 @@ func TestRealtimeRPC(t *testing.T) {
 
 		require.Equal(t, block["hash"], blockByHash["hash"], "Block hashes should match")
 		require.Equal(t, block["number"], blockByHash["number"], "Block numbers should match")
+	})
+
+	t.Run("RealtimeSubscriptionWorking", func(t *testing.T) {
+		var iterations = 3
+		latestBlockNum, err := client.RealtimeBlockNumber()
+		require.NoError(t, err)
+		require.Greater(t, latestBlockNum, uint64(0), "Latest block number should be greater than 0")
+
+		logger := log.New()
+		wsClient, err := rpc.Dial(DefaultL2NetworkWSURL, logger)
+		require.NoError(t, err)
+
+		realtimeMsgCh := make(chan realtimeapi.RealtimeSubResult)
+		realtimeSub, err := wsClient.Subscribe(ctx, "eth", realtimeMsgCh, "realtime", map[string]bool{"newHeads": false, "transactionExtraInfo": true, "transactionReceipt": true, "transactionInnerTxs": true})
+		require.NoError(t, err)
+		defer realtimeSub.Unsubscribe()
+
+		for i := 0; i < iterations; i++ {
+			// Send tx
+			signedTx := nativeTransferTx(t, ctx, client, uint256.NewInt(encoding.Gwei), testAddress.String())
+			g, _ := errgroup.WithContext(ctx)
+
+			// realtime subscription
+			g.Go(func() error {
+
+				for {
+					select {
+					case msg := <-realtimeMsgCh:
+						// BlockTime should always be returned
+						if msg.BlockTime == 0 {
+							return fmt.Errorf("block time is 0 and not sent")
+						}
+						// Since we set the TransactionExtraInfo, TransactionReceipt, and TransactionInnerTxs to true, these fields should not be nil
+						if msg.TxData == nil {
+							return fmt.Errorf("tx data is nil")
+						}
+						if msg.Receipt == nil {
+							return fmt.Errorf("receipt is nil")
+						}
+						if msg.InnerTxs == nil {
+							return fmt.Errorf("inner transactions is nil")
+						}
+						if msg.TxHash == signedTx.Hash().String() {
+							return nil
+						}
+					case err := <-realtimeSub.Err():
+						return err
+					case <-time.After(DefaultTimeoutTxToBeMined):
+						return fmt.Errorf("realtime subscription timeout")
+					}
+				}
+			})
+
+			// Wait for all goroutines to complete
+			err = g.Wait()
+			require.NoError(t, err)
+		}
+	})
+
+	t.Run("RealtimeSubscriptionWorkingWithSubscribedFromAddress", func(t *testing.T) {
+		var iterations = 3
+		latestBlockNum, err := client.RealtimeBlockNumber()
+		require.NoError(t, err)
+		require.Greater(t, latestBlockNum, uint64(0), "Latest block number should be greater than 0")
+
+		logger := log.New()
+		wsClient, err := rpc.Dial(DefaultL2NetworkWSURL, logger)
+		require.NoError(t, err)
+
+		realtimeMsgCh := make(chan realtimeapi.RealtimeSubResult)
+		realtimeSub, err := wsClient.Subscribe(ctx, "eth", realtimeMsgCh, "realtime", map[string]interface{}{"newHeads": false, "transactionExtraInfo": true, "transactionReceipt": true, "transactionInnerTxs": true, "subscribedAddresses": []string{DefaultL2AdminAddress}})
+		require.NoError(t, err)
+		defer realtimeSub.Unsubscribe()
+
+		for i := 0; i < iterations; i++ {
+			// Send tx
+			signedTx := nativeTransferTx(t, ctx, client, uint256.NewInt(encoding.Gwei), testAddress.String())
+			g, _ := errgroup.WithContext(ctx)
+
+			// realtime subscription
+			g.Go(func() error {
+
+				for {
+					select {
+					case msg := <-realtimeMsgCh:
+						// BlockTime should always be returned
+						if msg.BlockTime == 0 {
+							return fmt.Errorf("block time is 0 and not sent")
+						}
+						// Since we set the TransactionExtraInfo, TransactionReceipt, and TransactionInnerTxs to true, these fields should not be nil
+						if msg.TxData == nil {
+							return fmt.Errorf("tx data is nil")
+						}
+						if msg.Receipt == nil {
+							return fmt.Errorf("receipt is nil")
+						}
+						if msg.InnerTxs == nil {
+							return fmt.Errorf("inner transactions is nil")
+						}
+						if msg.TxHash == signedTx.Hash().String() {
+							return nil
+						}
+					case err := <-realtimeSub.Err():
+						return err
+					case <-time.After(DefaultTimeoutTxToBeMined):
+						return fmt.Errorf("realtime subscription timeout")
+					}
+				}
+			})
+
+			// Wait for all goroutines to complete
+			err = g.Wait()
+			require.NoError(t, err)
+		}
+	})
+
+	t.Run("RealtimeSubscriptionWorkingWithSubscribedToAddress", func(t *testing.T) {
+		var iterations = 3
+		latestBlockNum, err := client.RealtimeBlockNumber()
+		require.NoError(t, err)
+		require.Greater(t, latestBlockNum, uint64(0), "Latest block number should be greater than 0")
+
+		logger := log.New()
+		wsClient, err := rpc.Dial(DefaultL2NetworkWSURL, logger)
+		require.NoError(t, err)
+
+		realtimeMsgCh := make(chan realtimeapi.RealtimeSubResult)
+		realtimeSub, err := wsClient.Subscribe(ctx, "eth", realtimeMsgCh, "realtime", map[string]interface{}{"newHeads": false, "transactionExtraInfo": true, "transactionReceipt": true, "transactionInnerTxs": true, "subscribedAddresses": []string{testAddress.String()}})
+		require.NoError(t, err)
+		defer realtimeSub.Unsubscribe()
+
+		for i := 0; i < iterations; i++ {
+			// Send tx
+			signedTx := nativeTransferTx(t, ctx, client, uint256.NewInt(encoding.Gwei), testAddress.String())
+			g, _ := errgroup.WithContext(ctx)
+
+			// realtime subscription
+			g.Go(func() error {
+
+				for {
+					select {
+					case msg := <-realtimeMsgCh:
+						// BlockTime should always be returned
+						if msg.BlockTime == 0 {
+							return fmt.Errorf("block time is 0 and not sent")
+						}
+						// Since we set the TransactionExtraInfo, TransactionReceipt, and TransactionInnerTxs to true, these fields should not be nil
+						if msg.TxData == nil {
+							return fmt.Errorf("tx data is nil")
+						}
+						if msg.Receipt == nil {
+							return fmt.Errorf("receipt is nil")
+						}
+						if msg.InnerTxs == nil {
+							return fmt.Errorf("inner transactions is nil")
+						}
+						if msg.TxHash == signedTx.Hash().String() {
+							return nil
+						}
+					case err := <-realtimeSub.Err():
+						return err
+					case <-time.After(DefaultTimeoutTxToBeMined):
+						return fmt.Errorf("realtime subscription timeout")
+					}
+				}
+			})
+
+			// Wait for all goroutines to complete
+			err = g.Wait()
+			require.NoError(t, err)
+		}
 	})
 }
 
@@ -406,7 +670,6 @@ func TestRealtimeStateIsConsistent(t *testing.T) {
 	// Dump state cache for further checking
 	err = client.RealtimeDumpCache()
 	require.NoError(t, err)
-
 	compareCacheWithSequenceDB(t, DefaultSequncerDBPath, DefaultStateCachePath)
 }
 
@@ -429,108 +692,189 @@ func compareCacheWithSequenceDB(t *testing.T, dbDir, cacheDir string) {
 		cacheFiles[fileName] = string(data)
 	}
 
+	maxAttempts := 5
+	retryDelay := 1 * time.Second
+
+	var err error
+
+	for attempts := 0; attempts < maxAttempts; attempts++ {
+		err = performCacheComparison(dbDir, cacheFiles)
+
+		if err == nil {
+			return
+		}
+
+		time.Sleep(retryDelay)
+	}
+
+	require.NoError(t, err, "Cache comparison failed after %d attempts", maxAttempts)
+}
+
+func performCacheComparison(dbDir string, cacheFiles map[string]string) error {
 	tempDbDir, err := ioutil.TempDir("", "mdbx_copy")
-	require.NoError(t, err, "Failed to create temp db dir")
+	if err != nil {
+		return fmt.Errorf("failed to create temp db dir: %v", err)
+	}
 	defer os.RemoveAll(tempDbDir)
 
+	// Copy database
 	cmd := exec.Command("cp", "-r", dbDir, tempDbDir)
 	output, err := cmd.CombinedOutput()
-	require.NoError(t, err, "Failed to copy db dir with cp -r: %s, output: %s", dbDir, string(output))
+	if err != nil {
+		return fmt.Errorf("failed to copy db dir: %v, output: %s", err, string(output))
+	}
 	copiedDbDir := filepath.Join(tempDbDir, filepath.Base(dbDir))
 
 	ctx := context.Background()
 	db, err := mdbx.NewMDBX(log.New()).Path(copiedDbDir).Open(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %v", err)
+	}
 	defer db.Close()
 
 	// Compare account data
 	if cacheFiles["account_cache.json"] != "" {
 		var accountCache map[string]string
-		err := json.Unmarshal([]byte(cacheFiles["account_cache.json"]), &accountCache)
-		require.NoError(t, err)
+		if err := json.Unmarshal([]byte(cacheFiles["account_cache.json"]), &accountCache); err != nil {
+			return fmt.Errorf("failed to unmarshal account cache: %v", err)
+		}
 
-		db.View(ctx, func(txn kv.Tx) error {
+		if err := db.View(ctx, func(txn kv.Tx) error {
 			for k, v := range accountCache {
 				key, err := hex.DecodeString(k)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode account key %s: %v", k, err)
+				}
 				value, err := txn.GetOne(kv.PlainState, key)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to read account %s from database: %v", k, err)
+				}
 
 				vBytes, _ := hex.DecodeString(v)
 				var dbAccount accounts.Account
 				err = dbAccount.DecodeForStorage(value)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode account %s from database: %v", k, err)
+				}
 
 				var cacheAccount accounts.Account
 				err = cacheAccount.DecodeForStorage(vBytes)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode account %s from cache: %v", k, err)
+				}
 
-				require.Equal(t, cacheAccount.Initialised, dbAccount.Initialised, "Initialised mismatch for account %s, from cache: %t, from db: %t", k, cacheAccount.Initialised, dbAccount.Initialised)
-				require.Equal(t, cacheAccount.Nonce, dbAccount.Nonce, "Nonce mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.Nonce, dbAccount.Nonce)
-				require.Equal(t, cacheAccount.Balance, dbAccount.Balance, "Balance mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.Balance.String(), dbAccount.Balance.String())
-				require.Equal(t, cacheAccount.Root, dbAccount.Root, "Root mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.Root.Hex(), dbAccount.Root.Hex())
-				require.Equal(t, cacheAccount.CodeHash, dbAccount.CodeHash, "CodeHash mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.CodeHash.Hex(), dbAccount.CodeHash.Hex())
-				require.Equal(t, cacheAccount.Incarnation, dbAccount.Incarnation, "Incarnation mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.Incarnation, dbAccount.Incarnation)
-				require.Equal(t, cacheAccount.PrevIncarnation, dbAccount.PrevIncarnation, "PrevIncarnation mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.PrevIncarnation, dbAccount.PrevIncarnation)
+				// Check all account fields for mismatches
+				if cacheAccount.Initialised != dbAccount.Initialised {
+					return fmt.Errorf("initialised mismatch for account %s, from cache: %t, from db: %t", k, cacheAccount.Initialised, dbAccount.Initialised)
+				}
+				if cacheAccount.Nonce != dbAccount.Nonce {
+					return fmt.Errorf("nonce mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.Nonce, dbAccount.Nonce)
+				}
+				if cacheAccount.Balance != dbAccount.Balance {
+					return fmt.Errorf("balance mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.Balance.String(), dbAccount.Balance.String())
+				}
+				if cacheAccount.Root != dbAccount.Root {
+					return fmt.Errorf("root mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.Root.Hex(), dbAccount.Root.Hex())
+				}
+				if cacheAccount.CodeHash != dbAccount.CodeHash {
+					return fmt.Errorf("codeHash mismatch for account %s, from cache: %s, from db: %s", k, cacheAccount.CodeHash.Hex(), dbAccount.CodeHash.Hex())
+				}
+				if cacheAccount.Incarnation != dbAccount.Incarnation {
+					return fmt.Errorf("incarnation mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.Incarnation, dbAccount.Incarnation)
+				}
+				if cacheAccount.PrevIncarnation != dbAccount.PrevIncarnation {
+					return fmt.Errorf("prevIncarnation mismatch for account %s, from cache: %d, from db: %d", k, cacheAccount.PrevIncarnation, dbAccount.PrevIncarnation)
+				}
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	// Compare storage data
 	if cacheFiles["storage_cache.json"] != "" {
 		var storageCache map[string]string
-		err := json.Unmarshal([]byte(cacheFiles["storage_cache.json"]), &storageCache)
-		require.NoError(t, err)
+		if err := json.Unmarshal([]byte(cacheFiles["storage_cache.json"]), &storageCache); err != nil {
+			return fmt.Errorf("failed to unmarshal storage cache: %v", err)
+		}
 
-		db.View(ctx, func(txn kv.Tx) error {
+		if err := db.View(ctx, func(txn kv.Tx) error {
 			for k, v := range storageCache {
 				key, err := hex.DecodeString(k)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode storage key %s: %v", k, err)
+				}
 				value, err := txn.GetOne(kv.PlainState, key)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to read storage %s from database: %v", k, err)
+				}
 
-				require.Equal(t, v, hex.EncodeToString(value), "Storage mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				if v != hex.EncodeToString(value) {
+					return fmt.Errorf("storage mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				}
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	// Compare code data
 	if cacheFiles["code_cache.json"] != "" {
 		var codeCache map[string]string
-		err := json.Unmarshal([]byte(cacheFiles["code_cache.json"]), &codeCache)
-		require.NoError(t, err)
+		if err := json.Unmarshal([]byte(cacheFiles["code_cache.json"]), &codeCache); err != nil {
+			return fmt.Errorf("failed to unmarshal code cache: %v", err)
+		}
 
-		db.View(ctx, func(txn kv.Tx) error {
+		if err := db.View(ctx, func(txn kv.Tx) error {
 			for k, v := range codeCache {
 				key, err := hex.DecodeString(k)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode code key %s: %v", k, err)
+				}
 				value, err := txn.GetOne(kv.Code, key)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to read code %s from database: %v", k, err)
+				}
 
-				require.Equal(t, v, hex.EncodeToString(value), "Code mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				if v != hex.EncodeToString(value) {
+					return fmt.Errorf("code mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				}
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	// Compare incarnation data
 	if cacheFiles["incarnation_cache.json"] != "" {
 		var incarnationCache map[string]string
-		err := json.Unmarshal([]byte(cacheFiles["incarnation_cache.json"]), &incarnationCache)
-		require.NoError(t, err)
+		if err := json.Unmarshal([]byte(cacheFiles["incarnation_cache.json"]), &incarnationCache); err != nil {
+			return fmt.Errorf("failed to unmarshal incarnation cache: %v", err)
+		}
 
-		db.View(ctx, func(txn kv.Tx) error {
+		if err := db.View(ctx, func(txn kv.Tx) error {
 			for k, v := range incarnationCache {
 				key, err := hex.DecodeString(k)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to decode incarnation key %s: %v", k, err)
+				}
 				value, err := txn.GetOne(kv.Code, key)
-				require.NoError(t, err)
+				if err != nil {
+					return fmt.Errorf("failed to read incarnation %s from database: %v", k, err)
+				}
 
-				require.Equal(t, v, hex.EncodeToString(value), "Incarnation mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				if v != hex.EncodeToString(value) {
+					return fmt.Errorf("incarnation mismatch for key %s, from cache: %s, from db: %s", k, v, hex.EncodeToString(value))
+				}
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 	}
+
+	return nil
 }

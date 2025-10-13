@@ -12,6 +12,8 @@ require (
 
 replace github.com/ledgerwatch/erigon-lib => ./erigon-lib
 
+replace github.com/0xPolygonHermez/zkevm-data-streamer => github.com/okx/xlayer-data-streamer v0.4.1-rc2
+
 require (
 	gfx.cafe/util/go/generic v0.0.0-20230721185457-c559e86c829c
 	github.com/0xPolygonHermez/zkevm-data-streamer v0.2.9
@@ -88,7 +90,7 @@ require (
 	github.com/pion/randutil v0.1.0
 	github.com/pion/stun v0.3.5
 	github.com/pkg/errors v0.9.1
-	github.com/prometheus/client_golang v1.19.0
+	github.com/prometheus/client_golang v1.19.1
 	github.com/prometheus/client_model v0.6.1
 	github.com/prometheus/common v0.48.0
 	github.com/protolambda/ztyp v0.2.2

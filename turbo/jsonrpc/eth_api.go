@@ -104,6 +104,9 @@ type EthAPI interface {
 	GetProof(ctx context.Context, address common.Address, storageKeys []common.Hash, blockNr rpc.BlockNumberOrHash) (*accounts.AccProofResult, error)
 	CreateAccessList(ctx context.Context, args ethapi2.CallArgs, blockNrOrHash *rpc.BlockNumberOrHash, optimizeGas *bool) (*accessListResult, error)
 
+	// Pre-execution related (see ./eth_transaction_preexec.go)
+	TransactionPreExec(ctx context.Context, origins []PreArgs, blockNrOrHash *rpc.BlockNumberOrHash, stateOverrides *ethapi2.FlexibleStateOverrides) ([]PreResult, error)
+
 	// Mining related (see ./eth_mining.go)
 	Coinbase(ctx context.Context) (common.Address, error)
 	Hashrate(ctx context.Context) (uint64, error)
@@ -396,6 +399,7 @@ type APIImpl struct {
 	BulkAddTxsWaitTime time.Duration
 	txChan             chan txRequest
 	EnableNotify       bool
+	BlockGasLimit      uint64
 }
 
 // For X Layer, split db and ac
@@ -446,6 +450,7 @@ func NewEthAPI(base *BaseAPI, db kv.RoDB, dbsmt kv.RoDB, eth rpchelper.ApiBacken
 		EnableNotify:       ethCfg.XLayer.EnableAddTxNotify,
 		txChan:             make(chan txRequest, 1000),
 		dbsmt:              dbsmt,
+		BlockGasLimit:      ethCfg.XLayer.DynamicBlockGasLimit,
 	}
 
 	// For X Layer
