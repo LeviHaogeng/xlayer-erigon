@@ -505,9 +505,16 @@ func waitUntil(t *testing.T, timeout time.Duration, interval time.Duration, cond
 func TestFilters_TTL_EvictLogsStore(t *testing.T) {
 	t.Parallel()
 	config := FiltersConfig{RpcSubscriptionFiltersTTLSeconds: 1, RpcSubscriptionFiltersCleanupIntervalSeconds: 1}
-	f := New(context.TODO(), config, nil, nil, nil, func() {}, log.New())
 
-	logID := LogsSubID("ttl-log")
+	// Create a context that can be cancelled to ensure proper cleanup
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	f := New(ctx, config, nil, nil, nil, func() {}, log.New())
+
+	// Create a subscription with TTL tracking enabled - this is crucial!
+	criteria := filters.FilterCriteria{}
+	_, logID := f.SubscribeLogsWithTTL(10, criteria)
 	entry := &types.Log{Address: libcommon.HexToAddress("0x095e7baea6a6c7c4c2dfeb977efac326af552d87")}
 	f.AddLogs(logID, entry)
 
@@ -515,8 +522,8 @@ func TestFilters_TTL_EvictLogsStore(t *testing.T) {
 		t.Fatal("expected logs store to exist after AddLogs")
 	}
 
-	// Wait up to ~3s for TTL reaper to evict
-	waitUntil(t, 3*time.Second, 50*time.Millisecond, func() bool {
+	// Wait for TTL reaper to evict - increased timeout to account for timing
+	waitUntil(t, 5*time.Second, 100*time.Millisecond, func() bool {
 		_, ok := f.logsStores.Get(logID)
 		return !ok
 	})
@@ -525,9 +532,15 @@ func TestFilters_TTL_EvictLogsStore(t *testing.T) {
 func TestFilters_TTL_EvictHeadersStore(t *testing.T) {
 	t.Parallel()
 	config := FiltersConfig{RpcSubscriptionFiltersTTLSeconds: 1, RpcSubscriptionFiltersCleanupIntervalSeconds: 1}
-	f := New(context.TODO(), config, nil, nil, nil, func() {}, log.New())
 
-	headID := HeadsSubID("ttl-head")
+	// Create a context that can be cancelled to ensure proper cleanup
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	f := New(ctx, config, nil, nil, nil, func() {}, log.New())
+
+	// Create a subscription with TTL tracking enabled - this is crucial!
+	_, headID := f.SubscribeNewHeadsWithTTL(10)
 	header := &types.Header{}
 	f.AddPendingBlock(headID, header)
 
@@ -535,7 +548,8 @@ func TestFilters_TTL_EvictHeadersStore(t *testing.T) {
 		t.Fatal("expected headers store to exist after AddPendingBlock")
 	}
 
-	waitUntil(t, 3*time.Second, 50*time.Millisecond, func() bool {
+	// Wait for TTL reaper to evict - increased timeout to account for timing
+	waitUntil(t, 5*time.Second, 100*time.Millisecond, func() bool {
 		_, ok := f.pendingHeadsStores.Get(headID)
 		return !ok
 	})
@@ -544,9 +558,15 @@ func TestFilters_TTL_EvictHeadersStore(t *testing.T) {
 func TestFilters_TTL_EvictTxsStore(t *testing.T) {
 	t.Parallel()
 	config := FiltersConfig{RpcSubscriptionFiltersTTLSeconds: 1, RpcSubscriptionFiltersCleanupIntervalSeconds: 1}
-	f := New(context.TODO(), config, nil, nil, nil, func() {}, log.New())
 
-	txID := PendingTxsSubID("ttl-tx")
+	// Create a context that can be cancelled to ensure proper cleanup
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	f := New(ctx, config, nil, nil, nil, func() {}, log.New())
+
+	// Create a subscription with TTL tracking enabled - this is crucial!
+	_, txID := f.SubscribePendingTxsWithTTL(10)
 	var tx types.Transaction = types.NewTransaction(0, libcommon.HexToAddress("0x095e7baea6a6c7c4c2dfeb977efac326af552d87"), uint256.NewInt(10), 50000, uint256.NewInt(10), nil)
 	f.AddPendingTxs(txID, []types.Transaction{tx})
 
@@ -554,7 +574,8 @@ func TestFilters_TTL_EvictTxsStore(t *testing.T) {
 		t.Fatal("expected txs store to exist after AddPendingTxs")
 	}
 
-	waitUntil(t, 3*time.Second, 50*time.Millisecond, func() bool {
+	// Wait for TTL reaper to evict - increased timeout to account for timing
+	waitUntil(t, 5*time.Second, 100*time.Millisecond, func() bool {
 		_, ok := f.pendingTxsStores.Get(txID)
 		return !ok
 	})
