@@ -138,6 +138,22 @@ services:
     command: >
       cdk-erigon --http.vhosts=* --http.corsdomain=* --ws --config=/usr/src/app/config.yaml
 
+  xlayer-testnet-rpc:
+    container_name: xlayer-testnet-rpc
+    image: cdk-erigon
+    environment:
+      - CDK_ERIGON_SEQUENCER=0
+    ports:
+      - 6061:6060
+      - 8124:8545
+      - 6901:6900
+      - 9091:9095
+    volumes:
+      - ./testnet/rpc:/home/erigon/data/
+      - ./config/xlayerconfig-testnet-rpc.yaml:/usr/src/app/config.yaml
+    command: >
+      cdk-erigon --http.vhosts=* --http.corsdomain=* --ws --config=/usr/src/app/config.yaml
+
   xlayer-kafka:
     image: bitnamilegacy/kafka:4.0.0-debian-12-r10
     container_name: xlayer-kafka

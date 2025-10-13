@@ -119,6 +119,7 @@ xlayerconfig-testnet.yaml
 **/cover.out
 **/cover.html
 test/mainnet
+test/testnet
 test/lrp/mainnet
 test/lrp/external_ds
 test/*.zip
@@ -137,3 +138,4 @@ cmd/prune-mdbx-data/compact-db-tool
 cmd/prune-mdbx-data/prune-chaindata-tool
 cmd/prune-mdbx-data/list-tables-tool
 cmd/prune-mdbx-data/prune-tool
+zk/datastream/xlayer-data-streamer/

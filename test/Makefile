@@ -14,6 +14,7 @@ DOCKER_PROMETHEUS := prometheus
 DOCKER_GRAFANA := grafana
 DOCKER_MAINNET_SEQ := xlayer-mainnet-seq
 DOCKER_MAINNET_RPC := xlayer-mainnet-rpc
+DOCKER_TESTNET_RPC := xlayer-testnet-rpc
 DOCKER_KAFKA := xlayer-kafka
 
 # Apollo
@@ -32,6 +33,7 @@ RUN_DOCKER_RPC := $(DOCKER_COMPOSE) up -d $(DOCKER_RPC)
 RUN_DOCKER_RPC_2 := $(DOCKER_COMPOSE) up -d $(DOCKER_RPC_2)
 RUN_DOCKER_MAINNET_SEQ := $(DOCKER_COMPOSE) up -d $(DOCKER_MAINNET_SEQ)
 RUN_DOCKER_MAINNET_RPC := $(DOCKER_COMPOSE) up -d $(DOCKER_MAINNET_RPC)
+RUN_DOCKER_TESTNET_RPC := $(DOCKER_COMPOSE) up -d $(DOCKER_TESTNET_RPC)
 RUN_DOCKER_L1_NETWORK := $(DOCKER_COMPOSE) up -d $(DOCKER_L1_NETWORK)
 RUN_DOCKER_POOL_DB := $(DOCKER_COMPOSE) up -d $(DOCKER_POOL_DB)
 RUN_DOCKER_POOL_MANAGER := $(DOCKER_COMPOSE) up -d $(DOCKER_POOL_MANAGER)
@@ -601,6 +603,9 @@ mainnet: build-docker
 
 mainnet-rpc: build-docker
 	$(RUN_DOCKER_MAINNET_RPC)
+
+testnet-rpc: build-docker
+	$(RUN_DOCKER_TESTNET_RPC)
 
 vmtouch:
 	docker exec -it xlayer-seq sh -c "vmtouch -t /home/erigon/data/chaindata/mdbx.dat"
