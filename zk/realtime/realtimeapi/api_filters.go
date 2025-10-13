@@ -49,7 +49,7 @@ func (api *RealtimeAPIImpl) Realtime(ctx context.Context, criteria realtimeSub.S
 
 				result := RealtimeSubResult{}
 				if criteria.NewHeads && msg.BlockMsg != nil {
-					if err != nil || msg.BlockMsg.Header == nil {
+					if msg.BlockMsg.Header == nil {
 						log.Warn(fmt.Sprintf("[Realtime] subscription error: getting block info, err: %v", err))
 						continue
 					}

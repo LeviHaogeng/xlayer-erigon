@@ -105,12 +105,12 @@ type RealtimeCache struct {
 	subService *realtimeSub.RealtimeSubscription
 }
 
-func NewRealtimeCache(ctx context.Context, db kv.RoDB, tx kv.Tx, subService *realtimeSub.RealtimeSubscription, chainName string, cacheDumpPath string, heightThreshold uint64) (*RealtimeCache, error) {
+func NewRealtimeCache(ctx context.Context, db kv.RoDB, subService *realtimeSub.RealtimeSubscription, chainName string, cacheDumpPath string, heightThreshold uint64) (*RealtimeCache, error) {
 	return &RealtimeCache{
 		ctx:                    ctx,
 		db:                     db,
 		chainName:              chainName,
-		State:                  NewStateCache(DefaultStateBlockCacheSize),
+		State:                  NewStateCache(ctx, db, chainName, DefaultStateBlockCacheSize),
 		Stateless:              NewStatelessCache(DefaultStatelessBlockCacheSize, DefaultStatelessTxCacheSize),
 		ReadyFlag:              atomic.Bool{},
 		CacheDumpPath:          cacheDumpPath,
@@ -167,10 +167,7 @@ func (cache *RealtimeCache) UpdateExecution(finishEntry realtimeTypes.FinishedEn
 	return nil
 }
 
-func (cache *RealtimeCache) GetPendingHeight() uint64 {
-	if cache.GetHighestPendingHeight() == 0 {
-		return 0
-	}
+func (cache *RealtimeCache) GetNextPendingHeight() uint64 {
 	return cache.GetHighestConfirmHeight() + 1
 }
 
@@ -455,7 +452,7 @@ func (cache *RealtimeCache) GetPendingStateCache() (state.StateReader, uint64) {
 	if cache.pendingBlocks.Size() == 0 {
 		return nil, 0
 	}
-	pendingHeight := cache.GetPendingHeight()
+	pendingHeight := cache.GetNextPendingHeight()
 	stateReader, err := cache.GetPendingBlockStateCache(pendingHeight)
 	if err != nil {
 		return nil, 0

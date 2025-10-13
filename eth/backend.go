@@ -1318,7 +1318,7 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 						backend.realtimeSub = realtimeSub.NewRealtimeSubscription()
 						backend.realtimeSub.Start(ctx)
 					}
-					backend.realtimeCache, err = realtimeCache.NewRealtimeCache(backend.sentryCtx, backend.chainDB, tx, backend.realtimeSub, chainConfig.ChainName, cfg.Zk.XLayer.Realtime.CacheDumpPath, cfg.Zk.XLayer.Realtime.CacheHeightThreshold)
+					backend.realtimeCache, err = realtimeCache.NewRealtimeCache(backend.sentryCtx, backend.chainDB, backend.realtimeSub, chainConfig.ChainName, cfg.Zk.XLayer.Realtime.CacheDumpPath, cfg.Zk.XLayer.Realtime.CacheHeightThreshold)
 					if err != nil {
 						backend.kafkaEnabled = false
 						log.Warn("[Realtime] Failed to initialize realtime cache", "error", err)

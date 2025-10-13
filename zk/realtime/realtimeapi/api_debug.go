@@ -47,15 +47,7 @@ func (api *RealtimeDebugApiImpl) RealtimeCompareStateCache(ctx context.Context) 
 		return nil, ErrRealtimeNotEnabled
 	}
 
-	// Note that there is a chance there will be differences in state, as RT confirmed state might
-	// be ahead of the chainstate confirmed state.
-	reader, tx, err := api.ethApi.CreateLatestStateReader(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("compareStateCache cannot create latest state reader: %w", err)
-	}
-	defer tx.Rollback()
-
-	mismatches, err := api.cacheDB.State.DebugCompare(reader)
+	mismatches, err := api.cacheDB.State.DebugCompare()
 	if err != nil {
 		return nil, fmt.Errorf("compareStateCache cannot compare state cache: %w", err)
 	}

@@ -188,7 +188,7 @@ func realtimeLoop(ctx context.Context, realtimeCache *cache.RealtimeCache) {
 		}
 
 		// Check for corrupted cache
-		pendingHeight := realtimeCache.GetPendingHeight()
+		pendingHeight := realtimeCache.GetNextPendingHeight()
 		lastExecutionHeight := realtimeCache.GetExecutionHeight()
 		if pendingHeight != 0 && pendingHeight < lastExecutionHeight {
 			// Execution is ahead of pending cache. This should not happen
@@ -223,7 +223,8 @@ func realtimeLoop(ctx context.Context, realtimeCache *cache.RealtimeCache) {
 		}
 
 		// Handle confirmed block msg
-		if pendingHeight != 0 {
+		highestPendingHeight = realtimeCache.GetHighestPendingHeight()
+		if highestPendingHeight != 0 {
 			confirmBlockMsg, ok := kafkaCache.ConfirmedBlockMsgCache.Get(pendingHeight)
 			if ok {
 				err := realtimeCache.TryCloseBlockFromConfirmedBlockMsg(pendingHeight, confirmBlockMsg)

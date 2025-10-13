@@ -78,10 +78,7 @@ func (api *RealtimeAPIImpl) getBlockNumber(blockNr rpc.BlockNumber) (uint64, boo
 	if err != nil {
 		return 0, false, false, err
 	}
-	pendingHeight, err := api.getPendingHeightFromCache()
-	if err != nil {
-		return 0, false, false, err
-	}
+	pendingHeight := api.cacheDB.GetNextPendingHeight()
 
 	switch blockNr {
 	case rpc.LatestBlockNumber:
@@ -102,14 +99,6 @@ func (api *RealtimeAPIImpl) getBlockNumber(blockNr rpc.BlockNumber) (uint64, boo
 		}
 		return blockNumber, blockNumber == confirmHeight, blockNumber == pendingHeight, nil
 	}
-}
-
-func (api *RealtimeAPIImpl) getPendingHeightFromCache() (uint64, error) {
-	pendingHeight := api.cacheDB.GetPendingHeight()
-	if pendingHeight == 0 {
-		return 0, fmt.Errorf("no pending block number found in realtime cache")
-	}
-	return pendingHeight, nil
 }
 
 func (api *RealtimeAPIImpl) getConfirmHeightFromCache() (uint64, error) {

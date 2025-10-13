@@ -1,12 +1,15 @@
 package cache
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"sync"
 
+	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon/core/state"
+	"github.com/ledgerwatch/erigon/core/systemcontracts"
 	"github.com/ledgerwatch/erigon/crypto"
 	realtimeTypes "github.com/ledgerwatch/erigon/zk/realtime/types"
 )
@@ -17,14 +20,20 @@ var emptyCodeHash = crypto.Keccak256(nil)
 // execution logic. The highest block number in the block state cache holds the latest
 // confirmed realtime state.
 type StateCache struct {
-	cacheLock    sync.RWMutex
+	ctx          context.Context
+	db           kv.RoDB
+	chainName    string
 	globalHeight uint64
+	cacheLock    sync.RWMutex
 	blocksCache  map[uint64]*BlockStateCache
 }
 
-func NewStateCache(blocksCacheSize int) *StateCache {
+func NewStateCache(ctx context.Context, db kv.RoDB, chainName string, blocksCacheSize int) *StateCache {
 	return &StateCache{
+		ctx:          ctx,
 		globalHeight: 0,
+		chainName:    chainName,
+		db:           db,
 		blocksCache:  make(map[uint64]*BlockStateCache, blocksCacheSize),
 	}
 }
@@ -126,7 +135,7 @@ func (cache *StateCache) FlushBlock(blockNum uint64) error {
 
 // -------------- Debug operations --------------
 func (cache *StateCache) DebugDumpToFile(cacheDumpPath string) error {
-	flatten, err := cache.flattenState()
+	flatten, _, err := cache.flattenState()
 	if err != nil {
 		return err
 	}
@@ -173,8 +182,17 @@ func (cache *StateCache) DebugDumpToFile(cacheDumpPath string) error {
 
 // DebugCompare compares the state cache with the chain-state db, and returns the
 // list of account addresses that have differing states.
-func (cache *StateCache) DebugCompare(reader state.StateReader) ([]string, error) {
-	flatten, err := cache.flattenState()
+func (cache *StateCache) DebugCompare() ([]string, error) {
+	flatten, blockNum, err := cache.flattenState()
+	if err != nil {
+		return nil, err
+	}
+	tx, err := cache.db.BeginRo(cache.ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	reader, err := cache.GetDbStateReader(tx, blockNum)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +250,7 @@ func (cache *StateCache) DebugCompare(reader state.StateReader) ([]string, error
 	return mismatches, nil
 }
 
-func (cache *StateCache) flattenState() (*plainStateCache, error) {
+func (cache *StateCache) flattenState() (*plainStateCache, uint64, error) {
 	cache.cacheLock.RLock()
 	defer cache.cacheLock.RUnlock()
 
@@ -247,5 +265,12 @@ func (cache *StateCache) flattenState() (*plainStateCache, error) {
 		blockNum++
 	}
 
-	return flatten, nil
+	return flatten, blockNum - 1, nil
+}
+
+func (cache *StateCache) GetDbStateReader(tx kv.Tx, height uint64) (state.StateReader, error) {
+	// For some reason, erigon's history state reader uses block number + 1 for the state reader at
+	// height x
+	reader := state.NewPlainState(tx, height+1, systemcontracts.SystemContractCodeLookup[cache.chainName])
+	return reader, nil
 }
