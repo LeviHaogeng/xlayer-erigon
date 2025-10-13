@@ -100,6 +100,14 @@ var DefaultFlags = []cli.Flag{
 	&OverlayGetLogsFlag,
 	&OverlayReplayBlockFlag,
 
+	&RpcSubscriptionFiltersMaxLogsFlag,
+	&RpcSubscriptionFiltersMaxHeadersFlag,
+	&RpcSubscriptionFiltersMaxTxsFlag,
+	&RpcSubscriptionFiltersMaxAddressesFlag,
+	&RpcSubscriptionFiltersMaxTopicsFlag,
+	&RpcSubscriptionFiltersTTLSecondsFlag,
+	&RpcSubscriptionFiltersCleanupIntervalSecondsFlag,
+
 	&utils.SnapKeepBlocksFlag,
 	&utils.SnapStopFlag,
 	&utils.DbPageSizeFlag,
@@ -395,4 +403,7 @@ var DefaultFlags = []cli.Flag{
 	&utils.EnableLatestDataStreamBlockNumberGlobalVariableForRpc,
 	&utils.DataStreamUnwindToBlock,
 	&utils.SyncSeqLogs,
+
+	&utils.SequencerPaused,
+	&utils.DataStreamBatchOptimizationEnabled,
 }

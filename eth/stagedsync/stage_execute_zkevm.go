@@ -20,7 +20,6 @@ import (
 
 	"github.com/ledgerwatch/erigon/consensus/misc"
 	"github.com/ledgerwatch/erigon/core"
-	"github.com/ledgerwatch/erigon/turbo/rpchelper"
 	"github.com/ledgerwatch/erigon/zk/erigon_db"
 	"github.com/ledgerwatch/erigon/zk/hermez_db"
 
@@ -98,7 +97,7 @@ func SpawnExecuteBlocksStageZk(s *StageState, u Unwinder, tx kv.RwTx, toBlock ui
 		return fmt.Errorf("getBlockHashValues: %w", err)
 	}
 
-	to, total, err := getExecRange(cfg, tx, s.BlockNumber, toBlock, s.LogPrefix())
+	to, _, err := getExecRange(cfg, tx, s.BlockNumber, toBlock, s.LogPrefix())
 	if err != nil {
 		return fmt.Errorf("getExecRange: %w", err)
 	}
@@ -107,9 +106,9 @@ func SpawnExecuteBlocksStageZk(s *StageState, u Unwinder, tx kv.RwTx, toBlock ui
 
 	stateStream := !initialCycle && cfg.stateStream && to-s.BlockNumber < stateStreamLimit
 
-	logger := utils.NewTxGasLogger(logInterval, s.BlockNumber, total, gasState, s.LogPrefix(), &batch, tx, stages.SyncMetrics[stages.Execution])
-	logger.Start()
-	defer logger.Stop()
+	// logger := utils.NewTxGasLogger(logInterval, s.BlockNumber, total, gasState, s.LogPrefix(), &batch, tx, stages.SyncMetrics[stages.Execution])
+	// logger.Start()
+	// defer logger.Stop()
 
 	stageProgress := s.BlockNumber
 	var stoppedErr error
@@ -118,6 +117,9 @@ Loop:
 		if cfg.zk.SyncLimit > 0 && blockNum > cfg.zk.SyncLimit {
 			log.Info(fmt.Sprintf("[%s] Sync limit reached", s.LogPrefix()), "block", blockNum)
 			break
+		}
+		if blockNum&0xff == 0 {
+			log.Info("executing block", "block", blockNum)
 		}
 
 		if stoppedErr = common.Stopped(quit); stoppedErr != nil {
@@ -170,7 +172,7 @@ Loop:
 		stageProgress = blockNum
 		currentStateGas = currentStateGas + header.GasUsed
 
-		logger.AddBlock(uint64(block.Transactions().Len()), stageProgress, currentStateGas, blockNum)
+		// logger.AddBlock(uint64(block.Transactions().Len()), stageProgress, currentStateGas, blockNum)
 
 		utils.LogTrace(
 			"",                           // txhash
@@ -203,7 +205,7 @@ Loop:
 				}
 				defer tx.Rollback()
 				eridb = erigon_db.NewErigonDb(tx)
-				logger.SetTx(tx)
+				// logger.SetTx(tx)
 			}
 			batch = membatch.NewHashBatch(tx, quit, cfg.dirs.Tmp, log.New())
 			hermezDb = hermez_db.NewHermezDb(tx)
@@ -276,12 +278,18 @@ func getExecRange(cfg ExecuteBlockCfg, tx kv.RwTx, stageProgress, toBlock uint64
 		return to, total, nil
 	}
 
-	shouldShortCircuit, noProgressTo, err := utils.ShouldShortCircuitExecution(tx, logPrefix, cfg.zk.L2ShortCircuitToVerifiedBatch, func(tx kv.Tx) (uint64, error) {
-		return rpchelper.GetFinalizedBatchNumber(tx)
-	})
-	if err != nil {
-		return 0, 0, fmt.Errorf("ShouldShortCircuitExecution: %w", err)
-	}
+	/*
+		// X Layer: we do not roll up on L1 for RPC nodes anymore. Therefore, we no longer
+		// short-circuit execution to the L1 verified batch. Instead, we execute directly
+		// using the blocks downloaded from the DataStream, ignoring L1 verified batch
+		// boundaries here.
+		shouldShortCircuit, noProgressTo, err := utils.ShouldShortCircuitExecution(tx, logPrefix, cfg.zk.L2ShortCircuitToVerifiedBatch, func(tx kv.Tx) (uint64, error) {
+			return rpchelper.GetFinalizedBatchNumber(tx)
+		})
+		if err != nil {
+			return 0, 0, fmt.Errorf("ShouldShortCircuitExecution: %w", err)
+		}
+	*/
 	prevStageProgress, err := stages.GetStageProgress(tx, stages.Senders)
 	if err != nil {
 		return 0, 0, fmt.Errorf("getStageProgress: %w", err)
@@ -297,8 +305,16 @@ func getExecRange(cfg ExecuteBlockCfg, tx kv.RwTx, stageProgress, toBlock uint64
 		to = cmp.Min(prevStageProgress, toBlock)
 	}
 
-	if shouldShortCircuit {
-		to = noProgressTo
+	// if shouldShortCircuit {
+	// 	to = noProgressTo
+	// }
+
+	// For X Layer: Apply LoopBlockLimit to restrict maximum execution range per iteration
+	if cfg.syncCfg.LoopBlockLimit > 0 {
+		maxTo := stageProgress + uint64(cfg.syncCfg.LoopBlockLimit)
+		if to > maxTo {
+			to = maxTo
+		}
 	}
 
 	total := to - stageProgress
@@ -418,6 +434,12 @@ func postExecuteCommitValues(
 	if err := rawdb.WriteTxLookupEntries_zkEvm(tx, block); err != nil {
 		return fmt.Errorf("WriteTxLookupEntries_zkEvm: %w", err)
 	}
+
+	// Update block write latency metric: current time - block timestamp
+	currentTime := time.Now()
+	blockTime := time.Unix(int64(header.Time), 0)
+	latencySeconds := currentTime.Sub(blockTime).Seconds()
+	stages.BlockWriteLatencyMetric.Set(latencySeconds)
 
 	return nil
 }

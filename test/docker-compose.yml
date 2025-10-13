@@ -138,8 +138,24 @@ services:
     command: >
       cdk-erigon --http.vhosts=* --http.corsdomain=* --ws --config=/usr/src/app/config.yaml
 
+  xlayer-testnet-rpc:
+    container_name: xlayer-testnet-rpc
+    image: cdk-erigon
+    environment:
+      - CDK_ERIGON_SEQUENCER=0
+    ports:
+      - 6061:6060
+      - 8124:8545
+      - 6901:6900
+      - 9091:9095
+    volumes:
+      - ./testnet/rpc:/home/erigon/data/
+      - ./config/xlayerconfig-testnet-rpc.yaml:/usr/src/app/config.yaml
+    command: >
+      cdk-erigon --http.vhosts=* --http.corsdomain=* --ws --config=/usr/src/app/config.yaml
+
   xlayer-kafka:
-    image: bitnami/kafka:latest
+    image: bitnamilegacy/kafka:4.0.0-debian-12-r10
     container_name: xlayer-kafka
     ports:
       - 9095:9094
@@ -394,6 +410,7 @@ services:
       - 8548:8546
       - 6901:6900
       - 9091:9095
+      - 40000:40000
     volumes:
       - ./data/rpc/:/home/erigon/data/
       - ./config/test.erigon.rpc.config.yaml:/usr/src/app/config.yaml
@@ -404,6 +421,7 @@ services:
       - ./config/dynamic-mynetwork-conf.json:/usr/src/app/dynamic-mynetwork-conf.json
     command: >
       /bin/sh -c "CONFIG_FILE=config; if [ \"$$RT_ENABLED\" = \"1\" ]; then CONFIG_FILE=config.rt; fi; cdk-erigon --http.vhosts=* --http.corsdomain=* --ws --config=/usr/src/app/$$CONFIG_FILE.yaml"
+#      /bin/sh -c "CONFIG_FILE=config; if [ \"$$RT_ENABLED\" = \"1\" ]; then CONFIG_FILE=config.rt; fi; dlv exec /usr/local/bin/cdk-erigon --listen=:40000 --headless=true --api-version=2 --accept-multiclient -- --http.vhosts=* --http.corsdomain=* --ws --config=/usr/src/app/$$CONFIG_FILE.yaml"
 
   xlayer-rpc-2:
     container_name: xlayer-rpc-2
@@ -573,3 +591,84 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+
+
+  # Database optimization service
+  xlayer-prune:
+    container_name: xlayer-prune
+    image: cdk-erigon
+    volumes:
+      - ${XLAYER_DATA_DIR:-./data/seq/}:/home/erigon/data/
+    working_dir: /home/erigon
+    command: >
+      sh -c "
+        echo 'Action 1: Listing tables...' &&
+        prune-tool list-tables ./data &&
+        echo 'Action 2: Pruning...' &&
+        prune-tool prune-chaindata ./data aggressive --keep-recent-batches=1 --yes &&
+        echo 'Action 2 completed, listing tables...' &&
+        sleep 3 &&
+        prune-tool list-tables ./data &&
+        echo 'Action 3: Compacting chaindata...' &&
+        echo 'Checking for SMT database...' &&
+        if [ -f ./data/smt/mdbx.dat ]; then
+          echo 'Action 3: Compacting db with split-db...' &&
+          prune-tool compact-db -source data/chaindata -split-db -in-place &&
+          echo 'Compacting SMT database...' &&
+          prune-tool compact-db -source data/smt -in-place -split-db -type smt
+        else
+          echo 'Action 3: Compacting db without split-db...' &&
+          prune-tool compact-db -source data/chaindata  -in-place
+        fi &&
+        echo 'Action 3: Compacting db Done!' $XLAYER_DATA_DIR &&
+        sleep 3 &&
+        echo 'Action 4: Listing tables...' &&
+        prune-tool list-tables ./data &&
+        echo 'Action 4: Listing tables Done!' $XLAYER_DATA_DIR
+      "
+    restart: "no"
+
+  xlayer-prune-list:
+    container_name: xlayer-prune-list
+    image: cdk-erigon
+    volumes:
+      - ${XLAYER_DATA_DIR:-./data/seq/}:/home/erigon/data/
+    working_dir: /home/erigon
+    command: >
+      sh -c "
+        echo 'Action 1: Listing tables...' $XLAYER_DATA_DIR &&
+        prune-tool list-tables ./data &&
+        echo 'Action 1: Compacting db Done!' $XLAYER_DATA_DIR &&
+        sleep 3
+      "
+    restart: "no"
+
+  # Compact database
+  xlayer-compact:
+    container_name: xlayer-compact
+    image: cdk-erigon
+    volumes:
+      - ${XLAYER_DATA_DIR:-./data/seq/}:/home/erigon/data/
+    working_dir: /home/erigon
+    command: >
+      sh -c "
+        echo 'Action 1: Listing tables...' &&
+        prune-tool list-tables ./data &&
+        echo 'Action 2: Compacting chaindata...' &&
+        echo 'Checking for SMT database...' &&
+        if [ -f ./data/smt/mdbx.dat ]; then
+          echo 'Action 2: Compacting db with split-db...' &&
+          prune-tool compact-db -source data/chaindata -split-db -in-place &&
+          echo 'Compacting SMT database...' &&
+          prune-tool compact-db -source data/smt -in-place -split-db -type smt
+        else
+          echo 'Action 2: Compacting db without split-db...' &&
+          prune-tool compact-db -source data/chaindata  -in-place
+        fi &&
+        echo 'Action 2: Compacting db Done!' $XLAYER_DATA_DIR &&
+        sleep 2 &&
+        echo 'Action 3: Listing tables...' &&
+        prune-tool list-tables ./data &&
+        echo 'Action 3: Listing tables Done!' $XLAYER_DATA_DIR
+      "
+    restart: "no"

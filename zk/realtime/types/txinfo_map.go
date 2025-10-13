@@ -9,6 +9,8 @@ import (
 	zktypes "github.com/ledgerwatch/erigon/zk/types"
 )
 
+const DefaultBlockTxsListSize = 2000
+
 type TxInfo struct {
 	BlockNumber uint64
 	Tx          ethTypes.Transaction
@@ -17,16 +19,27 @@ type TxInfo struct {
 	Changeset   *Changeset
 }
 
+type BlockTx struct {
+	TxHash  common.Hash
+	TxIndex uint
+}
+
+func NewOrderedBlockTxsList() *OrderedList[BlockTx] {
+	return NewOrderedList(DefaultBlockTxsListSize, func(a, b BlockTx) int {
+		return int(a.TxIndex) - int(b.TxIndex)
+	})
+}
+
 type TxInfoMap struct {
 	txInfos  map[common.Hash]TxInfo
-	blockTxs map[uint64]map[common.Hash]struct{}
+	blockTxs map[uint64]*OrderedList[BlockTx]
 	mu       sync.RWMutex
 }
 
 func NewTxInfoMap(blockCacheSize int, txCacheSize int) *TxInfoMap {
 	return &TxInfoMap{
 		txInfos:  make(map[common.Hash]TxInfo, txCacheSize),
-		blockTxs: make(map[uint64]map[common.Hash]struct{}, blockCacheSize),
+		blockTxs: make(map[uint64]*OrderedList[BlockTx], blockCacheSize),
 	}
 }
 
@@ -42,9 +55,13 @@ func (rm *TxInfoMap) Put(blockNumber uint64, txHash common.Hash, tx ethTypes.Tra
 
 	rm.txInfos[txHash] = txInfo
 	if _, exists := rm.blockTxs[blockNumber]; !exists {
-		rm.blockTxs[blockNumber] = make(map[common.Hash]struct{})
+		rm.blockTxs[blockNumber] = NewOrderedBlockTxsList()
 	}
-	rm.blockTxs[blockNumber][txHash] = struct{}{}
+	rm.blockTxs[blockNumber].Add(BlockTx{
+		TxHash:  txHash,
+		TxIndex: receipt.TransactionIndex,
+	})
+	rm.blockTxs[blockNumber].Sort()
 }
 
 func (rm *TxInfoMap) Delete(blockNumber uint64) {
@@ -54,8 +71,8 @@ func (rm *TxInfoMap) Delete(blockNumber uint64) {
 	if !exists {
 		return
 	}
-	for txHash := range txHashes {
-		delete(rm.txInfos, txHash)
+	for _, blockTx := range txHashes.Items() {
+		delete(rm.txInfos, blockTx.TxHash)
 	}
 	delete(rm.blockTxs, blockNumber)
 }
@@ -67,20 +84,19 @@ func (rm *TxInfoMap) GetTx(txHash common.Hash) (ethTypes.Transaction, *ethTypes.
 	return txInfo.Tx, txInfo.Receipt, txInfo.BlockNumber, txInfo.InnerTxs, exists
 }
 
-func (rm *TxInfoMap) GetBlockTxs(blockNumber uint64) ([]common.Hash, bool) {
+func (rm *TxInfoMap) GetBlockTxs(blockNumber uint64) []common.Hash {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
+	hashes := make([]common.Hash, 0)
 	hashSet, exists := rm.blockTxs[blockNumber]
 	if !exists {
-		return nil, false
+		return hashes
 	}
 
-	hashes := make([]common.Hash, 0, len(hashSet))
-	for hash := range hashSet {
-		hashes = append(hashes, hash)
+	for _, blockTx := range hashSet.Items() {
+		hashes = append(hashes, blockTx.TxHash)
 	}
-
-	return hashes, true
+	return hashes
 }
 
 func (rm *TxInfoMap) Clear() {

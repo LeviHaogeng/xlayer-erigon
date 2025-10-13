@@ -28,7 +28,7 @@ func (api *RealtimeAPIImpl) Call(ctx context.Context, args ethapi2.CallArgs, blo
 		return api.APIImpl.Call(ctx, args, blockNrOrHash, overrides)
 	}
 
-	reader, blockNumber, err := api.createStateReader(&blockNrOrHash)
+	reader, blockNumber, err := api.createStateReader(blockNrOrHash)
 	if err != nil || reader == nil {
 		return api.APIImpl.Call(ctx, args, blockNrOrHash, overrides)
 	}
@@ -53,7 +53,7 @@ func (api *RealtimeAPIImpl) doRealtimeCall(ctx context.Context, args ethapi2.Cal
 		args.Gas = (*hexutil.Uint64)(&api.APIImpl.GasCap)
 	}
 
-	header, _, _, ok := api.cacheDB.Stateless.GetHeader(blockNumber)
+	header, _, _, ok := api.cacheDB.Stateless.GetBlockInfo(blockNumber)
 	if !ok {
 		return nil, fmt.Errorf("header not found for block number %d", blockNumber)
 	}
@@ -105,20 +105,29 @@ func (api *RealtimeAPIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi.C
 	if blockNrOrHash != nil {
 		bNrOrHash = *blockNrOrHash
 	}
-	stateReader, blockNumber, err := api.createStateReader(&bNrOrHash)
+	stateReader, blockNumber, err := api.createStateReader(bNrOrHash)
 	if err != nil || stateReader == nil {
 		return api.APIImpl.EstimateGas(ctx, argsOrNil, blockNrOrHash)
 	}
-	header, _, _, ok := api.cacheDB.Stateless.GetHeader(blockNumber)
+	header, _, _, ok := api.cacheDB.Stateless.GetBlockInfo(blockNumber)
 	if !ok {
 		return 0, fmt.Errorf("header not found for block number %d", blockNumber)
+	}
+
+	// Retrieve from rpc
+	gaslimit, err := api.GetBlockGasLimit(ctx)
+	if err != nil {
+		return 0, err
 	}
 
 	// Determine the highest gas limit can be used during the estimation.
 	if args.Gas != nil && uint64(*args.Gas) >= params.TxGas {
 		hi = uint64(*args.Gas)
+		if hi > gaslimit.Uint64() {
+			hi = gaslimit.Uint64()
+		}
 	} else {
-		hi = header.GasLimit
+		hi = gaslimit.Uint64()
 	}
 
 	var feeCap *big.Int

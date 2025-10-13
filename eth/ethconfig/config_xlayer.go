@@ -76,6 +76,10 @@ type XLayerConfig struct {
 	DataStreamUnwindToBlock uint64
 
 	SyncSeqLogs bool
+
+	SequencerPaused bool
+
+	DataStreamBatchOptimizationEnabled bool
 }
 
 var DefaultXLayerConfig = XLayerConfig{}

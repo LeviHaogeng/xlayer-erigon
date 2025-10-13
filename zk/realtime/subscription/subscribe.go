@@ -4,18 +4,16 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"sync/atomic"
 
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/eth/filters"
 	kafkaTypes "github.com/ledgerwatch/erigon/zk/realtime/kafka/types"
 	realtimeTypes "github.com/ledgerwatch/erigon/zk/realtime/types"
-	"github.com/ledgerwatch/log/v3"
 )
 
 const (
-	DefaultChannelSize          = 1000
+	DefaultChannelSize          = 10000
 	DefaultSubscribeChannelSize = 256
 
 	// Limit the number of subscriptions on the node
@@ -28,7 +26,6 @@ type RealtimeSubMessage struct {
 }
 
 type RealtimeSubscription struct {
-	currHeight atomic.Uint64
 	rtSubs     *SyncMap[SubID, Sub[RealtimeSubMessage]]
 	logsSubs   *SyncMap[SubID, *LogsFilter]
 	newMsgChan chan RealtimeSubMessage
@@ -36,7 +33,6 @@ type RealtimeSubscription struct {
 
 func NewRealtimeSubscription() *RealtimeSubscription {
 	return &RealtimeSubscription{
-		currHeight: atomic.Uint64{},
 		rtSubs:     NewSyncMap[SubID, Sub[RealtimeSubMessage]](),
 		logsSubs:   NewSyncMap[SubID, *LogsFilter](),
 		newMsgChan: make(chan RealtimeSubMessage, DefaultChannelSize),
@@ -70,22 +66,6 @@ func (ff *RealtimeSubscription) Start(ctx context.Context) {
 }
 
 func (ff *RealtimeSubscription) handleRealtimeMsgs(ctx context.Context, msg RealtimeSubMessage) {
-	msgHeight := uint64(0)
-	if msg.BlockMsg != nil {
-		msgHeight = msg.BlockMsg.Header.Number.Uint64()
-	} else if msg.TxMsg != nil {
-		msgHeight = msg.TxMsg.BlockNumber
-	}
-
-	if msgHeight < ff.currHeight.Load() {
-		// Ignore msg from previous blocks
-		log.Debug(fmt.Sprintf("[Realtime] Subscription ignoring msg from previous block. msgHeight: %d, currHeight: %d", msgHeight, ff.currHeight.Load()))
-		return
-	}
-	if msgHeight > ff.currHeight.Load() {
-		ff.currHeight.Store(msgHeight)
-	}
-
 	ff.rtSubs.Range(func(k SubID, v Sub[RealtimeSubMessage]) error {
 		select {
 		case <-ctx.Done():
