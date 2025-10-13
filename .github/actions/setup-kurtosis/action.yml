@@ -8,11 +8,19 @@ runs:
       with:
         path: cdk-erigon
 
+    - name: Free up disk space
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf "/usr/local/share/boost"
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
     - name: Checkout kurtosis-cdk
       uses: actions/checkout@v4
       with:
         repository: 0xPolygon/kurtosis-cdk
-        ref: v0.4.7
+        ref: v0.4.18
         path: kurtosis-cdk
 
     - name: Install Kurtosis CDK tools
